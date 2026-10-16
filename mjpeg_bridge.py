@@ -31,12 +31,21 @@ except ImportError:
     PIL_AVAILABLE = False
 # Internal stream identifiers (not encoded into packets by the core).
 CHANNEL_FACE, CHANNEL_LEFT, CHANNEL_RIGHT = 0, 1, 2
+CHANNELS = (CHANNEL_FACE, CHANNEL_LEFT, CHANNEL_RIGHT)
+EYE_CHANNELS = (CHANNEL_LEFT, CHANNEL_RIGHT)
 APP_VERSION = "1.0.7"
 DEFAULT_PORT = 0000
 READ_TIMEOUT = 3.0
 MAX_BUFFER_BYTES = 16 * 1024 * 1024
 MOTION_HISTORY_SECONDS = 4.0
 LOGGER = logging.getLogger("narebridge")
+# 설정, 로그, 패킷 JSON은 실행 파일 옆에 저장한다. 스크립트로 실행하면 스크립트 옆에 저장한다.
+# 사용자가 배너 이미지 등을 바꿔서 사용할 수 있도록 assets도 같은 폴더에서 불러온다.
+APP_DIRECTORY = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
 
 
 class DiagnosticQueueHandler(QueueHandler):
@@ -64,14 +73,9 @@ def configure_diagnostics():
     global DIAGNOSTIC_LISTENER, DIAGNOSTIC_HANDLER
     if DIAGNOSTIC_LISTENER is not None:
         return
-    directory = (
-        Path(sys.executable).resolve().parent
-        if getattr(sys, "frozen", False)
-        else Path(__file__).resolve().parent
-    )
     try:
         file_handler = RotatingFileHandler(
-            directory / "bridge.log", maxBytes=8 * 1024 * 1024, backupCount=4, encoding="utf-8"
+            APP_DIRECTORY / "bridge.log", maxBytes=8 * 1024 * 1024, backupCount=4, encoding="utf-8"
         )
         file_handler.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s")
@@ -108,6 +112,23 @@ def shutdown_diagnostics():
 
 def diagnostic(event, level=logging.INFO, **details):
     LOGGER.log(level, "%s %s", event, json.dumps(details, ensure_ascii=False, default=str))
+
+
+def write_json_atomic(path, data, prefix):
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=prefix, suffix=".tmp", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
 
 
 # Public example: a length-prefixed JPEG datagram for your own receiver.
@@ -151,7 +172,7 @@ class FrameTransforms:
         self.lock = threading.Lock()
         saved = saved if isinstance(saved, dict) else {}
         self.values = {}
-        for channel in (CHANNEL_FACE, CHANNEL_LEFT, CHANNEL_RIGHT):
+        for channel in CHANNELS:
             value = saved.get(str(channel), {})
             value = value if isinstance(value, dict) else {}
             rotation = value.get("rotation", 0)
@@ -196,11 +217,29 @@ class PacketAdapter:
         namespace = {"__name__": "user_packet_adapter"}
         # Executing user code is intentional: only load locally trusted code.
         exec(compile(code, "<packet-adapter>", "exec"), namespace)
-        fn = namespace.get("encode_frame")
-        if not callable(fn):
+        encode_frame = namespace.get("encode_frame")
+        if not callable(encode_frame):
             raise ValueError("encode_frame(channel, frame_id, jpeg_bytes) 함수를 정의하세요.")
-        self.fn = fn
+        self.encode_frame = encode_frame
         self.call_lock = threading.Lock()
+
+    @staticmethod
+    def validate_packet_list(packets):
+        if not isinstance(packets, (list, tuple)):
+            raise TypeError("encode_frame은 bytes 패킷의 목록을 반환해야 합니다.")
+        if len(packets) > 65535:
+            raise ValueError("한 프레임의 패킷 수가 너무 많습니다.")
+
+    @staticmethod
+    def validate_packet(packet):
+        if not isinstance(packet, bytes) or not 0 < len(packet) <= 65507:
+            raise ValueError("각 패킷은 bytes 형식이며 크기는 1~65507바이트여야 합니다.")
+
+    @classmethod
+    def validate_packets(cls, packets):
+        cls.validate_packet_list(packets)
+        for packet in packets:
+            cls.validate_packet(packet)
 
     def send(self, sock, target, channel, frame_id, jpeg_bytes):
         if not jpeg_bytes:
@@ -211,15 +250,12 @@ class PacketAdapter:
         transformed = time.monotonic()
         with self.call_lock:
             acquired = time.monotonic()
-            packets = self.fn(channel, frame_id, jpeg_bytes)
+            packets = self.encode_frame(channel, frame_id, jpeg_bytes)
         encoded = time.monotonic()
-        if not isinstance(packets, (list, tuple)):
-            raise TypeError("encode_frame은 bytes 패킷의 목록을 반환해야 합니다.")
-        if len(packets) > 65535:
-            raise ValueError("한 프레임의 패킷 수가 너무 많습니다.")
+        self.validate_packet_list(packets)
+        # 패킷을 하나씩 검사하며 보낸다. 잘못된 패킷이 나오면 그 앞의 정상 패킷은 이미 보낸 상태로 오류를 낸다.
         for packet in packets:
-            if not isinstance(packet, bytes) or not 0 < len(packet) <= 65507:
-                raise ValueError("각 패킷은 bytes 형식이며 크기는 1~65507바이트여야 합니다.")
+            self.validate_packet(packet)
             sock.sendto(packet, target)
         finished = time.monotonic()
         if finished - started >= 0.05:
@@ -251,6 +287,30 @@ class StreamStats:
     dropped: int = 0
 
 
+def record_sent_frame(stats, stats_lock, channel, packets, jpeg_size, sent_time=None):
+    with stats_lock:
+        st = stats[channel]
+        st.frames += 1
+        st.packets += packets
+        if sent_time is not None:
+            st.last_frame_time = sent_time
+        st.last_frame_size = jpeg_size
+        st.error = ""
+
+
+def record_send_error(stats, stats_lock, channel, frame_id, jpeg, exc):
+    diagnostic(
+        "SEND_ERROR",
+        logging.ERROR,
+        channel=channel,
+        frame_id=frame_id,
+        jpeg_bytes=len(jpeg),
+        error=repr(exc),
+    )
+    with stats_lock:
+        stats[channel].error = f"패킷 코드 오류: {exc}"
+
+
 class EyeSynchronizer:
     """Estimate right-minus-left motion lag, then delay ONLY the leading eye.
     For delta_t > 0 right arrives later, so left is delayed by delta_t.
@@ -265,20 +325,20 @@ class EyeSynchronizer:
         self.stats, self.stats_lock = stats, stats_lock
         self.enabled = enabled
         self.cv = threading.Condition()
-        self.queues = {CHANNEL_LEFT: deque(), CHANNEL_RIGHT: deque()}
-        self.histories = {CHANNEL_LEFT: deque(maxlen=900), CHANNEL_RIGHT: deque(maxlen=900)}
-        self.prev_image = {CHANNEL_LEFT: None, CHANNEL_RIGHT: None}
+        self.queues = {ch: deque() for ch in EYE_CHANNELS}
+        self.histories = {ch: deque(maxlen=900) for ch in EYE_CHANNELS}
+        self.prev_image = dict.fromkeys(EYE_CHANNELS)
         self.offset = 0.0  # delta_t = right event arrival - left event arrival
         self.confidence = False
         self.last_calibrated_event = float("-inf")
-        self.frame_ids = {CHANNEL_LEFT: 0, CHANNEL_RIGHT: 0}
+        self.frame_ids = dict.fromkeys(EYE_CHANNELS, 0)
         self.sent_frames = 0
-        self.skipped = 0
-        self.analysis_queues = {CHANNEL_LEFT: deque(maxlen=4), CHANNEL_RIGHT: deque(maxlen=4)}
+        self.dropped = 0
+        self.analysis_queues = {ch: deque(maxlen=4) for ch in EYE_CHANNELS}
         self.analysis_ms = 0.0
         self.calibration_ms = 0.0
         self.calibration_generation = 0
-        self.thread = threading.Thread(target=self._run, daemon=True, name="eye-delay")
+        self.send_thread = threading.Thread(target=self._run, daemon=True, name="eye-delay")
         self.calibration_thread = threading.Thread(
             target=self._calibrate, daemon=True, name="eye-calibration"
         )
@@ -288,8 +348,14 @@ class EyeSynchronizer:
 
     def start(self):
         self.analysis_thread.start()
-        self.thread.start()
+        self.send_thread.start()
         self.calibration_thread.start()
+
+    def is_alive(self):
+        return any(
+            thread.is_alive()
+            for thread in (self.send_thread, self.calibration_thread, self.analysis_thread)
+        )
 
     def _calibrate(self):
         while not self.stop_event.is_set():
@@ -301,16 +367,8 @@ class EyeSynchronizer:
     def set_enabled(self, enabled):
         diagnostic("SYNC_CHANGED", enabled=bool(enabled))
         with self.cv:
-            self.calibration_generation += 1
             self.enabled = bool(enabled)
-            self.offset = 0.0
-            self.confidence = False
-            self.last_calibrated_event = float("-inf")
-            for channel in self.histories:
-                self.analysis_queues[channel].clear()
-                self.histories[channel].clear()
-                self.prev_image[channel] = None
-            self.cv.notify_all()
+            self._reset_calibration(EYE_CHANNELS)
 
     def reset_channel(self, channel):
         with self.cv:
@@ -320,15 +378,20 @@ class EyeSynchronizer:
                 queued_discarded=len(self.queues[channel]),
                 offset_ms=round(self.offset * 1000, 1),
             )
-            self.calibration_generation += 1
-            self.analysis_queues[channel].clear()
             self.queues[channel].clear()
+            self._reset_calibration((channel,))
+
+    def _reset_calibration(self, channels):
+        # self.cv 잠금을 건 상태에서 호출해야 한다.
+        self.calibration_generation += 1
+        self.offset = 0.0
+        self.confidence = False
+        self.last_calibrated_event = float("-inf")
+        for channel in channels:
+            self.analysis_queues[channel].clear()
             self.histories[channel].clear()
             self.prev_image[channel] = None
-            self.confidence = False
-            self.offset = 0.0
-            self.last_calibrated_event = float("-inf")
-            self.cv.notify_all()
+        self.cv.notify_all()
 
     def _analyze(self):
         # Decode only in this worker; receiving and sending retain original bytes.
@@ -381,24 +444,30 @@ class EyeSynchronizer:
                 self.queues[channel].popleft()
                 dropped += 1
             if dropped:
-                self.skipped += dropped
-                with self.stats_lock:
-                    self.stats[channel].dropped += dropped
-                    total = self.stats[channel].dropped
-                diagnostic(
-                    "FRAME_DROP",
-                    logging.WARNING,
-                    channel=channel,
-                    source="enqueue",
-                    count=dropped,
-                    reasons=sorted(reasons),
-                    oldest_ms=round(oldest_age * 1000, 1),
-                    remaining=len(self.queues[channel]),
-                    total=total,
-                    sync_enabled=self.enabled,
-                    offset_ms=round(self.offset * 1000, 1),
+                self._record_drops(
+                    channel, dropped, "enqueue", sorted(reasons), oldest_age, self.offset
                 )
             self.cv.notify_all()
+
+    def _record_drops(self, channel, count, source, reasons, oldest_age, offset):
+        # self.cv 잠금을 건 상태에서 호출해야 한다.
+        self.dropped += count
+        with self.stats_lock:
+            self.stats[channel].dropped += count
+            total = self.stats[channel].dropped
+        diagnostic(
+            "FRAME_DROP",
+            logging.WARNING,
+            channel=channel,
+            source=source,
+            count=count,
+            reasons=reasons,
+            oldest_ms=round(oldest_age * 1000, 1),
+            remaining=len(self.queues[channel]),
+            total=total,
+            sync_enabled=self.enabled,
+            offset_ms=round(offset * 1000, 1),
+        )
 
     @staticmethod
     def _blink_candidates(samples):
@@ -471,27 +540,27 @@ class EyeSynchronizer:
             confidence, offset = self.confidence, self.offset
         if len(left) < 12 or len(right) < 12:
             return
-        levents = self._blink_candidates(left)
-        revents = self._blink_candidates(right)
-        if not levents or not revents:
+        left_events = self._blink_candidates(left)
+        right_events = self._blink_candidates(right)
+        if not left_events or not right_events:
             return
         matches = []
-        for ls, le, la in levents:
-            if ls <= last_event:
+        for left_start, left_end, left_strength in left_events:
+            if left_start <= last_event:
                 continue
-            for rs, re, ra in revents:
-                ds, de = rs - ls, re - le
-                if max(abs(ds), abs(de)) > 0.30:
+            for right_start, right_end, right_strength in right_events:
+                start_lag, end_lag = right_start - left_start, right_end - left_end
+                if max(abs(start_lag), abs(end_lag)) > 0.30:
                     continue
-                if abs(ds - de) > 0.065:
+                if abs(start_lag - end_lag) > 0.065:
                     continue
-                lag = (ds + de) / 2
+                lag = (start_lag + end_lag) / 2
                 if confidence and abs(lag - offset) > 0.15:
                     continue
-                score = self._local_correlation(left, right, lag, ls)
+                score = self._local_correlation(left, right, lag, left_start)
                 if score < 0.65:
                     continue
-                matches.append((score, min(la, ra), lag, ls))
+                matches.append((score, min(left_strength, right_strength), lag, left_start))
         if not matches:
             return
         matches.sort(reverse=True)
@@ -532,22 +601,8 @@ class EyeSynchronizer:
                         q.popleft()
                         dropped += 1
                     if dropped:
-                        self.skipped += dropped
-                        with self.stats_lock:
-                            self.stats[ch].dropped += dropped
-                            total = self.stats[ch].dropped
-                        diagnostic(
-                            "FRAME_DROP",
-                            logging.WARNING,
-                            channel=ch,
-                            source="sender",
-                            count=dropped,
-                            reasons=["stale_frame"],
-                            oldest_ms=round(oldest_age * 1000, 1),
-                            remaining=len(q),
-                            total=total,
-                            sync_enabled=self.enabled,
-                            offset_ms=round(offset * 1000, 1),
+                        self._record_drops(
+                            ch, dropped, "sender", ["stale_frame"], oldest_age, offset
                         )
                     if q:
                         due.append((q[0][0] + delays[ch], ch))
@@ -568,46 +623,41 @@ class EyeSynchronizer:
             try:
                 count = self.adapter.send(self.sock, self.target, ch, frame_id, jpeg)
                 self.sent_frames += 1
-                with self.stats_lock:
-                    st = self.stats[ch]
-                    st.frames += 1
-                    st.packets += count
-                    st.last_frame_size = len(jpeg)
-                    st.error = ""
+                record_sent_frame(self.stats, self.stats_lock, ch, count, len(jpeg))
             except Exception as exc:
-                diagnostic(
-                    "SEND_ERROR",
-                    logging.ERROR,
-                    channel=ch,
-                    frame_id=frame_id,
-                    jpeg_bytes=len(jpeg),
-                    error=repr(exc),
-                )
-                with self.stats_lock:
-                    self.stats[ch].error = f"패킷 코드 오류: {exc}"
+                record_send_error(self.stats, self.stats_lock, ch, frame_id, jpeg, exc)
                 if not self.stop_event.is_set():
                     time.sleep(0.05)
 
 
 class MJPEGWorker(threading.Thread):
     def __init__(
-        self, name, url, channel, udp_socket, target, stop_event, stats, lock, synchronizer, adapter
+        self, name, url, channel, sock, target, stop_event, stats, stats_lock, synchronizer, adapter
     ):
         super().__init__(daemon=True, name=name)
         self.url, self.channel = url, channel
-        self.udp_socket, self.target = udp_socket, target
-        self.stop_event, self.stats, self.lock = stop_event, stats, lock
+        self.sock, self.target = sock, target
+        self.stop_event, self.stats, self.stats_lock = stop_event, stats, stats_lock
         self.synchronizer = synchronizer
         self.adapter = adapter
         self.frame_id = 0
 
     def set_stats(self, **kwargs):
-        with self.lock:
+        with self.stats_lock:
             s = self.stats[self.channel]
             for key, value in kwargs.items():
                 setattr(s, key, value)
 
+    @staticmethod
+    def _close_quietly(response):
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
     def run(self):
+        uses_sync = self.synchronizer is not None and self.channel in EYE_CHANNELS
         retry_delay = 0.5
         attempts = 0
         worker_started = time.monotonic()
@@ -708,43 +758,29 @@ class MJPEGWorker(threading.Thread):
                             )
                         last_complete_frame = arrived
                         retry_delay = 0.5
-                        now = time.monotonic()
-                        with self.lock:
+                        with self.stats_lock:
                             self.stats[self.channel].received += 1
-                        if self.synchronizer and self.channel in (CHANNEL_LEFT, CHANNEL_RIGHT):
-                            self.synchronizer.add(self.channel, jpeg, now)
-                            # Receive counters are updated independently from matched/sent counters.
-                            self.set_stats(connected=True, error="")
+                        if uses_sync:
+                            self.synchronizer.add(self.channel, jpeg, arrived)
+                            # 동기화 과정에서 프레임이 버려질 수 있으므로, 눈 채널의 상태는 전송 시각이 아닌
+                            # 도착 시각으로 판단한다.
+                            self.set_stats(connected=True, error="", last_frame_time=arrived)
                         else:
                             frame_id = self.frame_id
                             self.frame_id = (frame_id + 1) & 0xFFFF
                             # 패킷 코드나 UDP 전송에서 오류가 나도, 문제없는 카메라 연결까지 끊지는 않는다.
                             try:
                                 count = self.adapter.send(
-                                    self.udp_socket, self.target, self.channel, frame_id, jpeg
+                                    self.sock, self.target, self.channel, frame_id, jpeg
                                 )
                             except Exception as exc:
-                                diagnostic(
-                                    "SEND_ERROR",
-                                    logging.ERROR,
-                                    channel=self.channel,
-                                    frame_id=frame_id,
-                                    jpeg_bytes=len(jpeg),
-                                    error=repr(exc),
+                                record_send_error(
+                                    self.stats, self.stats_lock, self.channel, frame_id, jpeg, exc
                                 )
-                                self.set_stats(error=f"패킷 코드 오류: {exc}")
                                 continue
-                            with self.lock:
-                                st = self.stats[self.channel]
-                                st.frames += 1
-                                st.packets += count
-                                st.last_frame_time = now
-                                st.last_frame_size = len(jpeg)
-                                st.error = ""
-                        # Capture health for sync channels even when a pair is dropped.
-                        if self.synchronizer and self.channel in (CHANNEL_LEFT, CHANNEL_RIGHT):
-                            with self.lock:
-                                self.stats[self.channel].last_frame_time = now
+                            record_sent_frame(
+                                self.stats, self.stats_lock, self.channel, count, len(jpeg), arrived
+                            )
                     # Parse newly arrived data before deciding the stream stalled.
                     if time.monotonic() - last_complete_frame > READ_TIMEOUT:
                         raise ConnectionError("3초 동안 완전한 JPEG 프레임이 수신되지 않았습니다.")
@@ -754,7 +790,7 @@ class MJPEGWorker(threading.Thread):
                 # IncompleteRead, BadStatusLine 같은 http.client 오류는 OSError가 아니어서 따로 지정한다.
                 retry = isinstance(exc, (OSError, http.client.HTTPException))
                 failure_time = time.monotonic()
-                with self.lock:
+                with self.stats_lock:
                     state = dict(vars(self.stats[self.channel]))
                 diagnostic(
                     "DISCONNECTED",
@@ -776,17 +812,13 @@ class MJPEGWorker(threading.Thread):
                     retry_delay_s=retry_delay,
                 )
                 self.set_stats(connected=False, error=f"{type(exc).__name__}: {exc}")
-                if self.synchronizer and self.channel in (CHANNEL_LEFT, CHANNEL_RIGHT):
+                if uses_sync:
                     self.synchronizer.reset_channel(self.channel)
                 if not retry:
                     break
                 # Close before waiting and reopening only this failed channel.
-                if response is not None:
-                    try:
-                        response.close()
-                    except Exception:
-                        pass
-                    response = None
+                self._close_quietly(response)
+                response = None
                 diagnostic(
                     "RECONNECT_WAIT",
                     channel=self.channel,
@@ -797,11 +829,7 @@ class MJPEGWorker(threading.Thread):
                     break
                 retry_delay = min(5.0, retry_delay * 2)
             finally:
-                if response is not None:
-                    try:
-                        response.close()
-                    except Exception:
-                        pass
+                self._close_quietly(response)
         diagnostic(
             "STREAM_STOPPED",
             channel=self.channel,
@@ -810,21 +838,24 @@ class MJPEGWorker(threading.Thread):
         )
 
 
+@dataclass(frozen=True)
+class StreamInfo:
+    name: str
+    label: str
+    icon: str
+    channel: int
+    default_url: str
+
+
 class BridgeApp:
     STREAMS = (
-        ("Face", CHANNEL_FACE, "http://nareface.local/face"),
-        ("Left eye", CHANNEL_LEFT, "http://nareface.local/left"),
-        ("Right eye", CHANNEL_RIGHT, "http://nareface.local/right"),
+        StreamInfo("Face", "얼굴", "◎", CHANNEL_FACE, "http://nareface.local/face"),
+        StreamInfo("Left eye", "왼쪽 눈", "◉", CHANNEL_LEFT, "http://nareface.local/left"),
+        StreamInfo("Right eye", "오른쪽 눈", "◉", CHANNEL_RIGHT, "http://nareface.local/right"),
     )
 
     def __init__(self, root):
         self.root = root
-        # 사용자가 배너 이미지 등을 바꿔서 사용할 수 있도록, assets는 실행 파일 옆 폴더에서 불러온다.
-        self.app_directory = (
-            Path(sys.executable).resolve().parent
-            if getattr(sys, "frozen", False)
-            else Path(__file__).resolve().parent
-        )
         self._apply_window_icon(root)
         self.root.title(f"나래 - 외부 Facial 브릿지 v{APP_VERSION} by 백설기@")
         self.root.geometry("1280x900")
@@ -842,8 +873,8 @@ class BridgeApp:
         self._auto_start_timer = None
         self._auto_start_suspended = False
         self._editor_draft = None
-        self.adapter_path = self.app_directory / "packet_adapter.json"
-        self.settings_path = self.app_directory / "settings.json"
+        self.adapter_path = APP_DIRECTORY / "packet_adapter.json"
+        self.settings_path = APP_DIRECTORY / "settings.json"
         self._settings_data = {}
         self._saved_port = None
         self._port_save_timer = None
@@ -868,7 +899,7 @@ class BridgeApp:
         )
         self.editor_window = None
         self._close_editor = None
-        self._settings_timer = None
+        self._sync_panel_timer = None
         self._startup_error = None
         if self.adapter_path.exists():
             try:
@@ -876,9 +907,7 @@ class BridgeApp:
             except Exception as exc:
                 self._startup_error = self._error_message(exc)
         self.stats_lock = threading.Lock()
-        self.stats = {ch: StreamStats() for _, ch, _ in self.STREAMS}
-        self.prev_frames = {ch: 0 for _, ch, _ in self.STREAMS}
-        self.prev_received = {ch: 0 for _, ch, _ in self.STREAMS}
+        self._reset_stats()
         self.rx_fps_vars, self.drop_vars = {}, {}
         self._health_previous = {}
         self._health_baseline = {}
@@ -889,7 +918,7 @@ class BridgeApp:
         self.frame_transforms = FrameTransforms(self._settings_data.get("camera_transforms"))
         self.rotation_vars, self.mirror_buttons = {}, {}
         self.url_vars, self.status_vars = {}, {}
-        self.fps_vars, self.frame_vars, self.size_vars = {}, {}, {}
+        self.tx_fps_vars, self.size_vars = {}, {}
         self.sync_var = tk.BooleanVar(
             master=self.root, value=self._settings_data.get("eye_sync", True) is not False
         )
@@ -912,6 +941,12 @@ class BridgeApp:
             self.adapter_status_var.set("저장된 JSON 자동 불러오기 완료")
         self.root.after(500, self._update_ui)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _reset_stats(self):
+        with self.stats_lock:
+            self.stats = {ch: StreamStats() for ch in CHANNELS}
+            self.prev_sent = dict.fromkeys(CHANNELS, 0)
+            self.prev_received = dict.fromkeys(CHANNELS, 0)
 
     @staticmethod
     def validate_adapter_code(code):
@@ -941,30 +976,12 @@ class BridgeApp:
         if code.strip():
             self.validate_adapter_code(code)
         data = {"version": 1, "name": "Custom UDP adapter", "code": code}
-        temporary = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=self.adapter_path.parent,
-                prefix=".packet-adapter-",
-                suffix=".tmp",
-                delete=False,
-            ) as handle:
-                temporary = Path(handle.name)
-                json.dump(data, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.adapter_path)
-        finally:
-            if temporary is not None and temporary.exists():
-                temporary.unlink()
+        write_json_atomic(self.adapter_path, data, ".packet-adapter-")
         self.adapter_code = code
         self._editor_draft = None
         self._auto_start_suspended = False
         self.adapter_status_var.set("JSON 저장 완료 · 다음 실행 시 자동 불러오기")
-        self._refresh_adapter_readiness()
+        self._refresh_readiness()
 
     def _build_ui(self):
         bg, panel, inset, line = "#0c1119", "#141d29", "#0e1621", "#263344"
@@ -1116,7 +1133,7 @@ class BridgeApp:
         )
         hero.pack(fill="x", pady=(0, 16))
         self._hero_original = None
-        asset = self.app_directory / "assets" / "img.png"
+        asset = APP_DIRECTORY / "assets" / "img.png"
         if asset.exists():
             try:
                 if PIL_AVAILABLE:
@@ -1191,15 +1208,16 @@ class BridgeApp:
         label(heading, "스트림 모니터", 15, bold=True).pack(side="left")
         label(heading, "3 CHANNELS", 9, muted).pack(side="right")
         self.status_labels = {}
-        for name, ch, default_url in self.STREAMS:
+        for stream in self.STREAMS:
+            ch = stream.channel
             row = tk.Frame(
                 streams, bg=inset, highlightbackground=line, highlightthickness=1, padx=14, pady=4
             )
             row.pack(fill="x", pady=(0, 10))
             top = tk.Frame(row, bg=inset)
             top.pack(fill="x", pady=(0, 6))
-            label(top, ["◎", "◉", "◉"][ch], 17, accent).pack(side="left", padx=(0, 9))
-            label(top, ["얼굴", "왼쪽 눈", "오른쪽 눈"][ch], 12, bold=True).pack(side="left")
+            label(top, stream.icon, 17, accent).pack(side="left", padx=(0, 9))
+            label(top, stream.label, 12, bold=True).pack(side="left")
             label(top, f"CH 0{ch + 1}", 9, muted).pack(side="left", padx=(12, 8))
             rotation, mirror = self.frame_transforms.get(ch)
             self.rotation_vars[ch] = tk.StringVar(value=f"↻ {rotation}°")
@@ -1224,8 +1242,6 @@ class BridgeApp:
                 top,
                 text="↔ 반전",
                 command=lambda channel=ch: self._change_camera_transform(channel, mirror=True),
-                bg=accent if mirror else "#243247",
-                fg="#0c1119" if mirror else white,
                 activebackground="#30435c",
                 activeforeground=white,
                 relief="flat",
@@ -1236,6 +1252,7 @@ class BridgeApp:
                 padx=7,
                 pady=2,
             )
+            self._style_mirror_button(mirror_button, mirror)
             mirror_button.pack(side="left")
             self.mirror_buttons[ch] = mirror_button
             if not PIL_AVAILABLE:
@@ -1247,48 +1264,47 @@ class BridgeApp:
             self.status_labels[ch] = status
             saved_urls = self._settings_data.get("stream_urls", {})
             saved_url = (
-                saved_urls.get(str(ch), default_url)
+                saved_urls.get(str(ch), stream.default_url)
                 if isinstance(saved_urls, dict)
-                else default_url
+                else stream.default_url
             )
             self.url_vars[ch] = tk.StringVar(
-                value=saved_url if isinstance(saved_url, str) else default_url
+                value=saved_url if isinstance(saved_url, str) else stream.default_url
             )
             ttk.Entry(row, textvariable=self.url_vars[ch]).pack(fill="x")
             metrics = tk.Frame(row, bg=inset)
             metrics.pack(fill="x", pady=(6, 0))
-            self.fps_vars[ch] = tk.StringVar(value="0.0")
-            self.frame_vars[ch] = tk.StringVar(value="0")
+            self.tx_fps_vars[ch] = tk.StringVar(value="0.0")
             self.size_vars[ch] = tk.StringVar(value="—")
             self.rx_fps_vars[ch] = tk.StringVar(value="0.0")
             self.drop_vars[ch] = tk.StringVar(value="0")
             for title, var in [
                 ("수신 FPS", self.rx_fps_vars[ch]),
-                ("전송 FPS", self.fps_vars[ch]),
+                ("전송 FPS", self.tx_fps_vars[ch]),
                 ("DROP", self.drop_vars[ch]),
                 ("JPEG", self.size_vars[ch]),
             ]:
                 label(metrics, title, 8, muted).pack(side="left", padx=(0, 7))
                 label(metrics, size=10, textvariable=var).pack(side="left", padx=(0, 22))
-        self._build_sync_settings(streams)
+        self._build_sync_panel(streams)
 
         right = tk.Frame(body, bg=bg)
         right.grid(row=0, column=1, sticky="nsew")
         packet = card(right)
         packet.pack(fill="x", pady=(0, 14))
-        ph = tk.Frame(packet, bg=panel)
-        ph.pack(fill="x")
-        label(ph, "{ / }", 18, accent, True).pack(side="left")
-        label(ph, "PACKET WORKSPACE", 9, muted).pack(side="right")
+        packet_header = tk.Frame(packet, bg=panel)
+        packet_header.pack(fill="x")
+        label(packet_header, "{ / }", 18, accent, True).pack(side="left")
+        label(packet_header, "PACKET WORKSPACE", 9, muted).pack(side="right")
         label(packet, "사용자 지정 패킷", 17, bold=True).pack(anchor="w", pady=(8, 5))
         label(packet, "Python 코드 편집과 JSON 저장", 10, muted).pack(anchor="w")
-        self.packet_btn = ttk.Button(
+        packet_button = ttk.Button(
             packet,
             text="패킷 에디터 열기    ↗",
             style="Accent.TButton",
             command=self.open_packet_editor,
         )
-        self.packet_btn.pack(fill="x", ipady=11, pady=(16, 10))
+        packet_button.pack(fill="x", ipady=11, pady=(16, 10))
         ttk.Button(packet, text="↓  JSON 불러오기", command=self.load_adapter_json).pack(fill="x")
         self.adapter_status_var = tk.StringVar(value="저장하면 다음 실행 시 자동으로 불러옵니다.")
         label(
@@ -1356,11 +1372,11 @@ class BridgeApp:
             justify="left",
         ).pack(side="left")
         label(footer, "UDP / MJPEG", 9, muted).pack(side="right")
-        self._refresh_adapter_readiness()
+        self._refresh_readiness()
 
     def _apply_window_icon(self, window):
         window.after_idle(lambda: self._theme_title_bar(window))
-        assets = self.app_directory / "assets"
+        assets = APP_DIRECTORY / "assets"
         try:
             if not hasattr(self, "_app_icon") and (assets / "app_icon.png").exists():
                 self._app_icon = tk.PhotoImage(master=self.root, file=str(assets / "app_icon.png"))
@@ -1379,10 +1395,7 @@ class BridgeApp:
         from ctypes import wintypes
 
         try:
-            user = ctypes.windll.user32
-            user.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
-            user.GetAncestor.restype = wintypes.HWND
-            hwnd = user.GetAncestor(window.winfo_id(), 2)
+            hwnd = BridgeApp._window_handle(window)
             set_attribute = ctypes.windll.dwmapi.DwmSetWindowAttribute
             set_attribute.argtypes = [
                 wintypes.HWND,
@@ -1401,6 +1414,16 @@ class BridgeApp:
         except (AttributeError, OSError, tk.TclError):
             pass
 
+    @staticmethod
+    def _window_handle(window):
+        import ctypes
+        from ctypes import wintypes
+
+        user = ctypes.windll.user32
+        user.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user.GetAncestor.restype = wintypes.HWND
+        return user.GetAncestor(window.winfo_id(), 2)  # 2는 GA_ROOT(최상위 창)
+
     def _change_camera_transform(self, channel, rotate=False, mirror=False):
         rotation, flipped = self.frame_transforms.get(channel)
         if rotate:
@@ -1409,7 +1432,7 @@ class BridgeApp:
             flipped = not flipped
         settings = {
             str(ch): {"rotation": value[0], "mirror": value[1]}
-            for ch in (CHANNEL_FACE, CHANNEL_LEFT, CHANNEL_RIGHT)
+            for ch in CHANNELS
             for value in [self.frame_transforms.get(ch)]
         }
         settings[str(channel)] = {"rotation": rotation, "mirror": flipped}
@@ -1417,15 +1440,22 @@ class BridgeApp:
             return
         self.frame_transforms.set(channel, rotation, flipped)
         self.rotation_vars[channel].set(f"↻ {rotation}°")
-        self.mirror_buttons[channel].configure(
-            bg="#ff8587" if flipped else "#243247", fg="#0c1119" if flipped else "#e6edf5"
-        )
+        self._style_mirror_button(self.mirror_buttons[channel], flipped)
         diagnostic("CAMERA_TRANSFORM", channel=channel, rotation=rotation, mirror=flipped)
 
+    @staticmethod
+    def _style_mirror_button(button, mirrored):
+        button.configure(
+            bg="#ff8587" if mirrored else "#243247", fg="#0c1119" if mirrored else "#eef4fa"
+        )
+
+    def _reschedule(self, timer, callback):
+        if timer is not None:
+            self.root.after_cancel(timer)
+        return self.root.after(500, callback)
+
     def _schedule_url_save(self, *args):
-        if self._url_save_timer is not None:
-            self.root.after_cancel(self._url_save_timer)
-        self._url_save_timer = self.root.after(500, self._save_stream_urls)
+        self._url_save_timer = self._reschedule(self._url_save_timer, self._save_stream_urls)
 
     def _save_stream_urls(self):
         self._url_save_timer = None
@@ -1434,47 +1464,39 @@ class BridgeApp:
             self._write_settings(dict(self._settings_data, stream_urls=urls))
 
     def _schedule_port_save(self, *args):
-        if self._port_save_timer is not None:
-            self.root.after_cancel(self._port_save_timer)
-        self._port_save_timer = self.root.after(500, self._save_port)
+        self._port_save_timer = self._reschedule(self._port_save_timer, self._save_port)
 
     def _save_port(self):
         self._port_save_timer = None
-        try:
-            port = int(self.target_port_var.get().strip())
-        except ValueError:
-            return
-        if not 1 <= port <= 65535 or port == self._saved_port:
+        port = self._parse_port()
+        if port is None or port == self._saved_port:
             return
         data = dict(self._settings_data, port=port)
         if self._write_settings(data):
             self._saved_port = port
 
-    def _write_settings(self, data):
-        temporary = None
+    def _flush_pending_saves(self):
+        for timer in (self._port_save_timer, self._url_save_timer):
+            if timer is not None:
+                self.root.after_cancel(timer)
+        self._save_port()
+        self._save_stream_urls()
+
+    def _parse_port(self):
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=self.settings_path.parent,
-                prefix=".bridge-settings-",
-                suffix=".tmp",
-                delete=False,
-            ) as handle:
-                temporary = Path(handle.name)
-                json.dump(data, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.settings_path)
-            self._settings_data = data
-            return True
+            port = int(self.target_port_var.get().strip())
+        except ValueError:
+            return None
+        return port if 1 <= port <= 65535 else None
+
+    def _write_settings(self, data):
+        try:
+            write_json_atomic(self.settings_path, data, ".bridge-settings-")
         except OSError as exc:
             self._show_error("설정 저장 실패", self._error_message(exc), parent=self.root)
             return False
-        finally:
-            if temporary is not None and temporary.exists():
-                temporary.unlink()
+        self._settings_data = data
+        return True
 
     def open_program_manager(self):
         if self.program_window is not None and self.program_window.winfo_exists():
@@ -1628,14 +1650,10 @@ class BridgeApp:
     def _connection_settings_changed(self, *args):
         self._cancel_auto_start()
         self._auto_start_suspended = False
-        self._refresh_adapter_readiness()
+        self._refresh_readiness()
 
     def _readiness_error(self):
-        try:
-            port = int(self.target_port_var.get().strip())
-            if not 1 <= port <= 65535:
-                raise ValueError
-        except ValueError:
+        if self._parse_port() is None:
             return "포트 번호를 1~65535 사이의 정수로 입력하세요."
         if not self.adapter_code.strip() or (
             self._editor_draft is not None and not self._editor_draft.strip()
@@ -1652,7 +1670,7 @@ class BridgeApp:
         if not self.workers and not self._readiness_error() and not self._auto_start_suspended:
             self.start()
 
-    def _refresh_adapter_readiness(self, draft=None):
+    def _refresh_readiness(self, draft=None):
         self._last_ui_error = ""
         if draft is not None:
             self._editor_draft = draft
@@ -1790,13 +1808,11 @@ class BridgeApp:
                 ]
 
             user = ctypes.windll.user32
-            user.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
-            user.GetAncestor.restype = wintypes.HWND
             user.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
             user.MonitorFromWindow.restype = wintypes.HANDLE
             user.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
             user.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
-            hwnd = user.GetAncestor(self.root.winfo_id(), 2)
+            hwnd = self._window_handle(self.root)
             info = MonitorInfo()
             info.size = ctypes.sizeof(info)
             if user.GetMonitorInfoW(user.MonitorFromWindow(hwnd, 2), ctypes.byref(info)):
@@ -1821,7 +1837,7 @@ class BridgeApp:
         if self.root.winfo_height() != height:
             self.root.geometry(f"{width}x{height}")
 
-    def _build_sync_settings(self, parent):
+    def _build_sync_panel(self, parent):
         panel = tk.Frame(parent, bg="#141d29")
         panel.pack(fill="x", pady=(8, 0))
         tk.Frame(panel, bg="#263344", height=1).pack(fill="x", pady=(0, 12))
@@ -1837,7 +1853,6 @@ class BridgeApp:
             cursor="hand2",
         )
         box.pack(side="left", padx=(0, 10))
-        self.sync_checkbox = box
         title = tk.Label(
             row,
             text="눈 좌우 지연 동기화(매우 권장)",
@@ -1863,7 +1878,7 @@ class BridgeApp:
             self.sync_var.set(not self.sync_var.get())
             self._apply_eye_sync()
             draw_box()
-            self._update_settings_values()
+            self._update_sync_panel()
             return "break"
 
         box.bind("<Button-1>", toggle)
@@ -1903,7 +1918,7 @@ class BridgeApp:
                 fg="#ff8587",
                 font=("맑은 고딕", 14, "bold"),
             ).pack(anchor="w", pady=(3, 0))
-        self._poll_settings()
+        self._poll_sync_panel()
 
     def _apply_eye_sync(self):
         enabled = self.sync_var.get()
@@ -1914,7 +1929,7 @@ class BridgeApp:
                 # Reopen HTTP streams to discard data buffered while analysis lagged.
                 self.root.after_idle(self.reconnect)
 
-    def _update_settings_values(self):
+    def _update_sync_panel(self):
         sync = self.synchronizer
         offset, confidence = 0.0, False
         if sync is not None:
@@ -1934,14 +1949,14 @@ class BridgeApp:
         self.sync_value_vars["right"].set(f"{max(0.0, -offset) * 1000:.1f} ms")
         self.sync_value_vars["state"].set(state)
 
-    def _poll_settings(self):
-        self._update_settings_values()
-        self._settings_timer = self.root.after(200, self._poll_settings)
+    def _poll_sync_panel(self):
+        self._update_sync_panel()
+        self._sync_panel_timer = self.root.after(200, self._poll_sync_panel)
 
-    def _close_settings(self):
-        if self._settings_timer is not None:
-            self.root.after_cancel(self._settings_timer)
-            self._settings_timer = None
+    def _stop_sync_panel_polling(self):
+        if self._sync_panel_timer is not None:
+            self.root.after_cancel(self._sync_panel_timer)
+            self._sync_panel_timer = None
 
     def load_adapter_json(self, parent=None, editor=None):
         parent = parent or self.root
@@ -2025,7 +2040,7 @@ class BridgeApp:
 
         def code_changed(event=None):
             if code.edit_modified():
-                self._refresh_adapter_readiness(code.get("1.0", "end-1c"))
+                self._refresh_readiness(code.get("1.0", "end-1c"))
                 code.edit_modified(False)
 
         code.bind("<<Modified>>", code_changed)
@@ -2043,7 +2058,7 @@ class BridgeApp:
                     return False
             win.destroy()
             self._editor_draft = None
-            self._refresh_adapter_readiness()
+            self._refresh_readiness()
             return True
 
         self._close_editor = close_editor
@@ -2135,18 +2150,15 @@ class BridgeApp:
         if self.workers:
             return
         if not self.adapter_code.strip():
-            self._refresh_adapter_readiness()
+            self._refresh_readiness()
             self._show_error(
                 "준비 안 됨",
                 "패킷 에디터에서 코드를 저장하거나 JSON을 불러오세요.",
                 parent=self.root,
             )
             return
-        try:
-            port = int(self.target_port_var.get())
-            if not 1 <= port <= 65535:
-                raise ValueError
-        except ValueError:
+        port = self._parse_port()
+        if port is None:
             self._show_error(
                 "포트 번호를 확인하세요", "포트 번호는 1~65535 사이의 정수로 입력하세요.\n예: 5000"
             )
@@ -2158,7 +2170,7 @@ class BridgeApp:
                 "UDP 데이터를 받을 대상 IP 주소를 입력하세요.\n예: 127.0.0.1",
             )
             return
-        urls = {ch: self.url_vars[ch].get().strip() for _, ch, _ in self.STREAMS}
+        urls = {ch: self.url_vars[ch].get().strip() for ch in CHANNELS}
         if any(not u for u in urls.values()):
             self._show_error(
                 "카메라 주소를 확인하세요",
@@ -2167,11 +2179,7 @@ class BridgeApp:
             return
         try:
             self.adapter = PacketAdapter(self.adapter_code, self.frame_transforms)
-            test = self.adapter.fn(0, 0, b"\xff\xd8\xff\xd9")
-            if not isinstance(test, (list, tuple)) or not all(
-                isinstance(p, bytes) and 0 < len(p) <= 65507 for p in test
-            ):
-                raise ValueError("encode_frame은 bytes 패킷의 목록을 반환해야 합니다.")
+            PacketAdapter.validate_packets(self.adapter.encode_frame(0, 0, b"\xff\xd8\xff\xd9"))
         except Exception as exc:
             self._show_error("패킷 코드를 확인하세요", self._error_message(exc))
             return
@@ -2187,10 +2195,7 @@ class BridgeApp:
         self.stop_event = threading.Event()
         self._last_ui_error = ""
         target = (target_ip, port)
-        with self.stats_lock:
-            self.stats = {ch: StreamStats() for _, ch, _ in self.STREAMS}
-            self.prev_frames = {ch: 0 for _, ch, _ in self.STREAMS}
-            self.prev_received = {ch: 0 for _, ch, _ in self.STREAMS}
+        self._reset_stats()
         self.prev_time = time.monotonic()
         self.synchronizer = EyeSynchronizer(
             self.sock,
@@ -2201,14 +2206,13 @@ class BridgeApp:
             self.adapter,
             enabled=self.sync_var.get(),
         )
-        if self.synchronizer:
-            self.synchronizer.start()
+        self.synchronizer.start()
         self.workers = []
-        for name, ch, _ in self.STREAMS:
+        for stream in self.STREAMS:
             worker = MJPEGWorker(
-                name,
-                urls[ch],
-                ch,
+                stream.name,
+                urls[stream.channel],
+                stream.channel,
                 self.sock,
                 target,
                 self.stop_event,
@@ -2255,14 +2259,8 @@ class BridgeApp:
         if self.synchronizer is not None:
             with self.synchronizer.cv:
                 self.synchronizer.cv.notify_all()
-        alive = [worker for worker in self.workers if worker.is_alive()]
-        if alive or (
-            self.synchronizer is not None
-            and (
-                self.synchronizer.thread.is_alive()
-                or self.synchronizer.calibration_thread.is_alive()
-                or self.synchronizer.analysis_thread.is_alive()
-            )
+        if any(worker.is_alive() for worker in self.workers) or (
+            self.synchronizer is not None and self.synchronizer.is_alive()
         ):
             self.main_status_var.set("정지 중 · 카메라 연결이 종료되기를 기다립니다.")
             self._stop_timer = self.root.after(300, self.stop)
@@ -2276,10 +2274,10 @@ class BridgeApp:
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
         self.reconnect_btn.config(state="disabled")
-        self._refresh_adapter_readiness()
-        for _, ch, _ in self.STREAMS:
+        self._refresh_readiness()
+        for ch in CHANNELS:
             self.status_vars[ch].set("대기")
-            self.fps_vars[ch].set("0.0")
+            self.tx_fps_vars[ch].set("0.0")
         if self._reconnect_pending:
             self._reconnect_pending = False
             self.root.after(0, self.start)
@@ -2289,14 +2287,13 @@ class BridgeApp:
         dt = max(now - self.prev_time, 0.001)
         with self.stats_lock:
             snapshot = {ch: StreamStats(**vars(s)) for ch, s in self.stats.items()}
-        for _, ch, _ in self.STREAMS:
+        for ch in CHANNELS:
             s = snapshot[ch]
-            fps = (s.frames - self.prev_frames.get(ch, 0)) / dt
-            self.fps_vars[ch].set(f"{fps:.1f}")
+            fps = (s.frames - self.prev_sent.get(ch, 0)) / dt
+            self.tx_fps_vars[ch].set(f"{fps:.1f}")
             self.rx_fps_vars[ch].set(f"{(s.received - self.prev_received.get(ch, 0)) / dt:.1f}")
             self.drop_vars[ch].set(str(s.dropped))
             self.prev_received[ch] = s.received
-            self.frame_vars[ch].set(str(s.frames))
             self.size_vars[ch].set(
                 f"{s.last_frame_size / 1024:.1f} KiB" if s.last_frame_size else "—"
             )
@@ -2320,12 +2317,12 @@ class BridgeApp:
                 if s.error and self.workers
                 else "#8c9eb3"
             )
-            self.prev_frames[ch] = s.frames
+            self.prev_sent[ch] = s.frames
         self.prev_time = now
         errors = [
-            (name, snapshot[ch].error)
-            for name, ch, _ in self.STREAMS
-            if self.workers and snapshot[ch].error
+            (stream.name, snapshot[stream.channel].error)
+            for stream in self.STREAMS
+            if self.workers and snapshot[stream.channel].error
         ]
         if errors or self._last_ui_error:
             self.ready_indicator.configure(fg="#ff4f5e")
@@ -2349,7 +2346,7 @@ class BridgeApp:
             else:
                 state = "보정 완료" if sync.confidence else "분석 중"
                 eye = f"눈 동기화 보정값 {sync.offset * 1000:+.0f} ms({state})"
-            self.main_status_var.set(f"전송 중 · {eye} · 드롭 {sync.skipped}개")
+            self.main_status_var.set(f"전송 중 · {eye} · 드롭 {sync.dropped}개")
         if self.workers and now - self._log_time >= 5.0:
             elapsed = now - self._log_time
             self._log_time = now
@@ -2417,7 +2414,7 @@ class BridgeApp:
                         "packets": s.packets,
                         "drop": s.dropped,
                         "rx_fps": self.rx_fps_vars[ch].get(),
-                        "tx_fps": self.fps_vars[ch].get(),
+                        "tx_fps": self.tx_fps_vars[ch].get(),
                         "gap_s": round(now - s.last_frame_time, 2) if s.last_frame_time else None,
                         "jpeg_bytes": s.last_frame_size,
                         "connected": s.connected,
@@ -2437,15 +2434,9 @@ class BridgeApp:
             and not self._close_editor()
         ):
             return
-        if self._port_save_timer is not None:
-            self.root.after_cancel(self._port_save_timer)
-            self._port_save_timer = None
-        self._save_port()
-        if self._url_save_timer is not None:
-            self.root.after_cancel(self._url_save_timer)
-        self._save_stream_urls()
+        self._flush_pending_saves()
         self._cancel_auto_start()
-        self._close_settings()
+        self._stop_sync_panel_polling()
         self.stop()
         self.root.destroy()
 
