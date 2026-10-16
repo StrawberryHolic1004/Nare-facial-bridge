@@ -14,6 +14,8 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
 from dataclasses import dataclass
@@ -156,10 +158,22 @@ def validate_adapter_code(code):
         raise ValueError("패킷 코드가 비어 있습니다.")
     tree = ast.parse(code)
     compile(tree, "<packet-adapter>", "exec")
-    if not any(
-        isinstance(node, ast.FunctionDef) and node.name == "encode_frame" for node in tree.body
-    ):
+    if not any(binds_encode_frame(node) for node in tree.body):
         raise ValueError("encode_frame(channel, frame_id, jpeg_bytes) 함수를 정의하세요.")
+
+
+def binds_encode_frame(node):
+    # 코드를 실행하지 않고 검사하므로, 모듈 최상위에서 encode_frame을 def나 대입으로 정의했는지만 본다.
+    # 호출할 수 있는지는 PacketAdapter가 코드를 실행한 뒤 확인하므로, lambda를 대입한 경우도 통과시킨다.
+    if isinstance(node, ast.FunctionDef):
+        return node.name == "encode_frame"
+    if isinstance(node, ast.Assign):
+        targets = node.targets
+    elif isinstance(node, ast.AnnAssign) and node.value is not None:
+        targets = [node.target]
+    else:
+        return False
+    return any(isinstance(target, ast.Name) and target.id == "encode_frame" for target in targets)
 
 
 def read_adapter_file(path):
@@ -205,24 +219,6 @@ class SettingsStore:
         self.data = data
 
 
-# 공개용 예제: 채널 번호와 JPEG 길이를 앞에 붙여, 직접 만든 수신 프로그램으로 보내는 방식이다.
-# 다른 프로그램의 비공개 프로토콜을 따라 한 것이 아니다.
-EXAMPLE_ADAPTER = '''import struct
-def encode_frame(channel, frame_id, jpeg_bytes):
-    """Return a list of UDP datagrams (bytes).
-    channel: 0=face, 1=left eye, 2=right eye (internal input labels)
-    frame_id: monotonically increasing integer per channel (wrap is receiver-defined)
-    jpeg_bytes: original complete JPEG frame; do not re-encode unless needed
-    Use only a protocol you own, are authorized to use, or that is public.
-    """
-    # DEMONSTRATION ONLY: simple JPEG datagram for small images.
-    # For larger images, design packet fragmentation for your own receiver.
-    header = struct.pack("!BI", channel, len(jpeg_bytes))
-    data = header + jpeg_bytes
-    if len(data) > 60000:
-        raise ValueError("Example adapter supports JPEGs <= 59995 bytes")
-    return [data]
-'''
 AI_GUIDE = """CUSTOM UDP OUTPUT ADAPTER - IMPLEMENTATION CONTRACT
 Write a Python module defining exactly:
     def encode_frame(channel: int, frame_id: int, jpeg_bytes: bytes) -> list[bytes]:
@@ -233,6 +229,9 @@ Do not open sockets, sleep, write files or decode/re-encode the JPEG in this fun
 The host app handles transmission, timing, synchronization, reconnect and UI.
 Keep each datagram <= 65507 bytes (IPv4 UDP payload maximum); prefer smaller
 payloads if your receiver or network requires it. Handle oversized JPEG frames.
+Before streaming starts, the host app calls encode_frame(0, 0, b"\\xff\\xd8\\xff\\xd9")
+once with a 4-byte placeholder JPEG to check the return type. It must return a
+packet list for this input instead of raising, so do not reject small JPEG frames.
 Provide clear validation and use standard-library modules when possible.
 Implement only a protocol that the user owns, is authorized to implement,
 or that has publicly documented specifications. Do not guess private formats.
@@ -253,6 +252,11 @@ class FrameTransforms:
             if type(rotation) is not int or rotation not in (0, 90, 180, 270):
                 rotation = 0
             self.values[channel] = (rotation, value.get("mirror", False) is True)
+        if not PIL_AVAILABLE and any(value != (0, False) for value in self.values.values()):
+            # Pillow가 없으면 회전·반전 버튼을 누를 수 없으므로, 저장된 값도 적용하지 않고 원본 그대로 보낸다.
+            # 설정 파일의 값은 지우지 않으므로 Pillow를 설치하면 다시 적용된다.
+            diagnostic("CAMERA_TRANSFORM_IGNORED", saved=self.to_settings())
+            self.values = dict.fromkeys(CHANNELS, (0, False))
 
     def get(self, channel):
         with self.lock:
@@ -273,8 +277,6 @@ class FrameTransforms:
         rotation, mirror = self.get(channel)
         if rotation == 0 and not mirror:
             return jpeg
-        if not PIL_AVAILABLE:
-            raise RuntimeError("카메라 회전·반전에는 Pillow가 필요합니다.")
         with Image.open(io.BytesIO(jpeg)) as original:
             image = original.convert("RGB")
             if rotation:
@@ -290,6 +292,14 @@ class FrameTransforms:
             output = io.BytesIO()
             image.save(output, format="JPEG", quality=95, subsampling=0)
             return output.getvalue()
+
+
+class TransformError(Exception):
+    """카메라 회전·반전 중에 발생한 오류. 패킷 코드 오류와 구분해 표시하기 위해 사용한다."""
+
+
+class UdpSendError(Exception):
+    """UDP 전송 중에 발생한 OSError. 패킷 코드 오류와 구분해 표시하기 위해 사용한다."""
 
 
 class PacketAdapter:
@@ -331,7 +341,10 @@ class PacketAdapter:
             return 0
         started = time.monotonic()
         if self.transforms is not None:
-            jpeg_bytes = self.transforms.apply(channel, jpeg_bytes)
+            try:
+                jpeg_bytes = self.transforms.apply(channel, jpeg_bytes)
+            except Exception as exc:
+                raise TransformError(exc) from exc
         transformed = time.monotonic()
         with self.call_lock:
             acquired = time.monotonic()
@@ -341,7 +354,10 @@ class PacketAdapter:
         # 패킷을 하나씩 검사하며 보낸다. 잘못된 패킷이 나오면 그 앞의 정상 패킷은 이미 보낸 상태로 오류를 낸다.
         for packet in packets:
             self.validate_packet(packet)
-            sock.sendto(packet, target)
+            try:
+                sock.sendto(packet, target)
+            except OSError as exc:
+                raise UdpSendError(exc) from exc
         finished = time.monotonic()
         if finished - started >= 0.05:
             diagnostic(
@@ -385,19 +401,24 @@ def record_sent_frame(stats, stats_lock, channel, packets, jpeg_size, sent_time=
 
 # 채널별로 [마지막으로 남긴 오류, 남긴 시각, 그 뒤 건너뛴 횟수]를 저장한다.
 _SEND_ERROR_LOG = {}
+SEND_ERROR_LABELS = {TransformError: "카메라 회전·반전 오류", UdpSendError: "UDP 전송 오류"}
 
 
 def record_send_error(stats, stats_lock, channel, frame_id, jpeg, exc):
     error, now = repr(exc), time.monotonic()
+    label = SEND_ERROR_LABELS.get(type(exc), "패킷 코드 오류")
     with stats_lock:
-        stats[channel].error = f"패킷 코드 오류: {exc}"
-        # 패킷 코드가 고장 나면 프레임마다 같은 오류가 난다.
-        # 새 오류는 바로 남기고, 같은 오류는 1초에 한 번만 남긴다.
+        stats[channel].error = f"{label}: {exc}"
+        # 전송에 계속 실패하면 프레임마다 같은 오류가 반복된다.
+        # 새 오류는 바로 남기고, 같은 오류는 1초에 한 번만 남기면서 그동안 건너뛴 횟수를 함께 적는다.
+        # 다른 오류로 바뀌면, 이전 오류를 건너뛴 횟수는 previous_suppressed로 남긴다.
         last = _SEND_ERROR_LOG.get(channel)
-        if last is not None and last[0] == error and now - last[1] < 1.0:
+        same = last is not None and last[0] == error
+        if same and now - last[1] < 1.0:
             last[2] += 1
             return
-        suppressed = last[2] if last is not None else 0
+        suppressed = last[2] if same else 0
+        previous_suppressed = last[2] if last is not None and not same else 0
         _SEND_ERROR_LOG[channel] = [error, now, 0]
     diagnostic(
         "SEND_ERROR",
@@ -407,6 +428,7 @@ def record_send_error(stats, stats_lock, channel, frame_id, jpeg, exc):
         jpeg_bytes=len(jpeg),
         error=error,
         suppressed=suppressed,
+        previous_suppressed=previous_suppressed,
     )
 
 
@@ -431,9 +453,10 @@ class EyeSynchronizer:
         self.confidence = False
         self.last_calibrated_event = float("-inf")
         self.frame_ids = dict.fromkeys(EYE_CHANNELS, 0)
-        self.sent_frames = 0
         self.dropped = 0
         self.analysis_queues = {ch: deque(maxlen=4) for ch in EYE_CHANNELS}
+        # 채널별 (디코딩 실패 누계, 마지막으로 로그를 남긴 시각). 분석 스레드에서만 사용한다.
+        self.decode_failures = dict.fromkeys(EYE_CHANNELS, (0, float("-inf")))
         self.analysis_ms = 0.0
         self.calibration_ms = 0.0
         # 보정을 초기화할 때마다 1씩 올린다.
@@ -516,7 +539,8 @@ class EyeSynchronizer:
                     if previous is not None
                     else None
                 )
-            except Exception:
+            except Exception as exc:
+                self._record_decode_failure(channel, exc)
                 continue
             self.analysis_ms = (time.perf_counter() - started) * 1000
             with self.cv:
@@ -528,6 +552,23 @@ class EyeSynchronizer:
                     history.append((timestamp, motion))
                     while history and timestamp - history[0][0] > MOTION_HISTORY_SECONDS:
                         history.popleft()
+
+    def _record_decode_failure(self, channel, exc):
+        # 눈 JPEG가 계속 디코딩되지 않으면 보정이 끝나지 않는다. 로그가 프레임마다 쌓이지 않도록
+        # 채널마다 5초에 한 번만 남기고, 실패 횟수는 누계로 적는다.
+        count, last_logged = self.decode_failures[channel]
+        count += 1
+        now = time.monotonic()
+        if now - last_logged >= 5.0:
+            diagnostic(
+                "EYE_DECODE_FAILED",
+                logging.WARNING,
+                channel=channel,
+                count=count,
+                error=repr(exc),
+            )
+            last_logged = now
+        self.decode_failures[channel] = (count, last_logged)
 
     def add(self, channel, jpeg, timestamp):
         with self.cv:
@@ -725,12 +766,42 @@ class EyeSynchronizer:
             ch, frame_id, jpeg = selected
             try:
                 count = self.adapter.send(self.sock, self.target, ch, frame_id, jpeg)
-                self.sent_frames += 1
                 record_sent_frame(self.stats, self.stats_lock, ch, count, len(jpeg))
             except Exception as exc:
                 record_send_error(self.stats, self.stats_lock, ch, frame_id, jpeg, exc)
                 if not self.stop_event.is_set():
                     time.sleep(0.05)
+
+
+def is_http_url(url):
+    parts = urllib.parse.urlsplit(url)
+    return parts.scheme in ("http", "https") and bool(parts.netloc)
+
+
+def connection_error_message(exc):
+    """연결·수신 중에 발생한 예외를 하단 상태 줄에 표시할 한국어 문구로 변환한다. 자세한 내용은 진단 로그에 그대로 남는다."""
+    if type(exc) is ConnectionError:
+        return str(exc)
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"카메라가 HTTP {exc.code} 오류로 응답했습니다."
+    if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, Exception):
+        exc = exc.reason
+    if isinstance(exc, TimeoutError):
+        return "카메라가 응답하지 않습니다(연결 시간 초과)."
+    if isinstance(exc, socket.gaierror):
+        return "카메라 주소를 찾을 수 없습니다. 주소와 네트워크를 확인하세요."
+    if isinstance(exc, ConnectionRefusedError):
+        return "카메라가 연결을 거부했습니다."
+    # RemoteDisconnected는 ConnectionResetError이면서 HTTPException이기도 해서, 연결 끊김으로 먼저 분류한다.
+    if isinstance(exc, ConnectionError):
+        return "카메라 연결이 끊어졌습니다."
+    if isinstance(exc, http.client.InvalidURL):
+        return "카메라 주소 형식이 올바르지 않습니다."
+    if isinstance(exc, http.client.HTTPException):
+        return "카메라 응답이 올바르지 않습니다."
+    if isinstance(exc, OSError):
+        return "카메라와 통신하지 못했습니다."
+    return f"연결 오류: {exc}"
 
 
 class MJPEGWorker(threading.Thread):
@@ -873,7 +944,7 @@ class MJPEGWorker(threading.Thread):
                         else:
                             frame_id = self.frame_id
                             self.frame_id = (frame_id + 1) & 0xFFFF
-                            # 패킷 코드나 UDP 전송에서 오류가 나도, 문제없는 카메라 연결까지 끊지는 않는다.
+                            # 패킷 코드, 카메라 회전·반전, UDP 전송에서 오류가 나도 문제없는 카메라 연결까지 끊지는 않는다.
                             try:
                                 count = self.adapter.send(
                                     self.sock, self.target, self.channel, frame_id, jpeg
@@ -921,7 +992,7 @@ class MJPEGWorker(threading.Thread):
                     retry=retry,
                     retry_delay_s=retry_delay,
                 )
-                self.set_stats(connected=False, error=f"{type(exc).__name__}: {exc}")
+                self.set_stats(connected=False, error=connection_error_message(exc))
                 if uses_sync:
                     self.synchronizer.reset_channel(self.channel)
                 if not retry:
@@ -971,21 +1042,22 @@ class HealthMonitor:
             for direction, fps in rates[channel].items():
                 key = (channel, direction)
                 # 기준 FPS는 정상일 때만 지수 평균으로 갱신한다.
-                # 기준의 70% 밑으로 떨어지면 경고를 남기고, 85% 이상으로 회복되면 경고 상태를 푼다.
+                # 기준의 70% 밑으로 떨어지면 경고를 한 번 남기고, 85% 이상으로 회복되면 경고 상태를 푼다.
                 baseline = self._baseline.get(key, fps)
                 if baseline >= 5 and fps < baseline * 0.7:
-                    diagnostic(
-                        "FPS_DROP",
-                        logging.WARNING,
-                        channel=channel,
-                        direction=direction,
-                        fps=fps,
-                        baseline_fps=round(baseline, 2),
-                        window_s=round(elapsed, 2),
-                        connected=state.connected,
-                        error=state.error,
-                    )
-                    self._degraded.add(key)
+                    if key not in self._degraded:
+                        diagnostic(
+                            "FPS_DROP",
+                            logging.WARNING,
+                            channel=channel,
+                            direction=direction,
+                            fps=fps,
+                            baseline_fps=round(baseline, 2),
+                            window_s=round(elapsed, 2),
+                            connected=state.connected,
+                            error=state.error,
+                        )
+                        self._degraded.add(key)
                 elif key in self._degraded:
                     if fps >= baseline * 0.85:
                         diagnostic(
@@ -1028,6 +1100,8 @@ class BridgeApp:
         self.stop_event = None
         self._reconnect_pending = False
         self._stop_timer = None
+        # 대상 주소를 찾는 동안에는 확인 타이머 ID를 담고, 그 밖에는 None이다.
+        self._resolve_timer = None
         self.workers = []
         self.synchronizer = None
         self.adapter = None
@@ -1043,6 +1117,7 @@ class BridgeApp:
         self._saved_port = port if type(port) is int and 1 <= port <= 65535 else None
         self._port_save_timer = None
         self._url_save_timer = None
+        self._target_ip_save_timer = None
         programs = self.settings.get("programs", [])
         self.program_window = None
         self.program_list = None
@@ -1080,6 +1155,7 @@ class BridgeApp:
         for variable in (self.target_port_var, self.target_ip_var, *self.url_vars.values()):
             variable.trace_add("write", self._connection_settings_changed)
         self.target_port_var.trace_add("write", self._schedule_port_save)
+        self.target_ip_var.trace_add("write", self._schedule_target_ip_save)
         for variable in self.url_vars.values():
             variable.trace_add("write", self._schedule_url_save)
         if self._startup_error:
@@ -1097,6 +1173,7 @@ class BridgeApp:
     def _reset_stats(self):
         with self.stats_lock:
             self.stats = {ch: StreamStats() for ch in CHANNELS}
+            _SEND_ERROR_LOG.clear()
             self.prev_sent = dict.fromkeys(CHANNELS, 0)
             self.prev_received = dict.fromkeys(CHANNELS, 0)
 
@@ -1437,7 +1514,10 @@ class BridgeApp:
         self._label(fields, "포트", 9, MUTED).grid(
             row=0, column=1, sticky="w", padx=(10, 0), pady=(0, 5)
         )
-        self.target_ip_var = tk.StringVar(value="127.0.0.1")
+        saved_ip = self.settings.get("target_ip")
+        self.target_ip_var = tk.StringVar(
+            value=saved_ip if isinstance(saved_ip, str) and saved_ip.strip() else "127.0.0.1"
+        )
         self.target_port_var = tk.StringVar(
             value=str(self._saved_port if self._saved_port is not None else DEFAULT_PORT)
         )
@@ -1578,6 +1658,17 @@ class BridgeApp:
         if self.settings.get("stream_urls") != urls:
             self._save_settings(stream_urls=urls)
 
+    def _schedule_target_ip_save(self, *args):
+        self._target_ip_save_timer = self._reschedule(
+            self._target_ip_save_timer, self._save_target_ip
+        )
+
+    def _save_target_ip(self):
+        self._target_ip_save_timer = None
+        target_ip = self.target_ip_var.get().strip()
+        if target_ip and self.settings.get("target_ip") != target_ip:
+            self._save_settings(target_ip=target_ip)
+
     def _schedule_port_save(self, *args):
         self._port_save_timer = self._reschedule(self._port_save_timer, self._save_port)
 
@@ -1590,11 +1681,12 @@ class BridgeApp:
             self._saved_port = port
 
     def _flush_pending_saves(self):
-        for timer in (self._port_save_timer, self._url_save_timer):
+        for timer in (self._port_save_timer, self._url_save_timer, self._target_ip_save_timer):
             if timer is not None:
                 self.root.after_cancel(timer)
         self._save_port()
         self._save_stream_urls()
+        self._save_target_ip()
 
     def _parse_port(self):
         try:
@@ -1776,6 +1868,8 @@ class BridgeApp:
             return "UDP 대상 IP 주소를 입력하세요."
         if any(not var.get().strip() for var in self.url_vars.values()):
             return "모든 카메라 주소(URL)를 입력하세요."
+        if any(not is_http_url(var.get().strip()) for var in self.url_vars.values()):
+            return "카메라 주소는 http:// 또는 https://로 시작해야 합니다."
         return ""
 
     def _auto_start(self):
@@ -1794,7 +1888,7 @@ class BridgeApp:
         self.ready_indicator.configure(fg=ERROR_RED if runtime_error or not ready else READY_GREEN)
         if not ready:
             self._cancel_auto_start()
-        if not self.workers:
+        if not self.workers and self._resolve_timer is None:
             self.start_btn.configure(state="normal" if ready else "disabled")
             if ready and not self._auto_start_suspended:
                 if self._auto_start_timer is None:
@@ -2229,7 +2323,7 @@ class BridgeApp:
     def start(self):
         self._cancel_auto_start()
         self._auto_start_suspended = True
-        if self.workers:
+        if self.workers or self._resolve_timer is not None:
             return
         if not self.adapter_code.strip():
             self._refresh_readiness()
@@ -2259,6 +2353,12 @@ class BridgeApp:
                 "비어 있는 카메라 주소가 있습니다.\n얼굴, 왼쪽 눈, 오른쪽 눈의 MJPEG 주소(URL)를 모두 입력하세요.",
             )
             return
+        if any(not is_http_url(u) for u in urls.values()):
+            self._show_error(
+                "카메라 주소를 확인하세요",
+                "카메라 주소는 http:// 또는 https://로 시작해야 합니다.\n예: http://nareface.local/face",
+            )
+            return
         try:
             self.adapter = PacketAdapter(self.adapter_code, self.frame_transforms)
             # 연결을 시작하기 전에 작은 JPEG로 패킷 코드를 한 번 실행해 보고, 형식이 틀리면 바로 알린다.
@@ -2266,16 +2366,58 @@ class BridgeApp:
         except Exception as exc:
             self._show_error("패킷 코드를 확인하세요", self._error_message(exc))
             return
+        self._resolve_target(target_ip, port, urls)
+
+    def _resolve_target(self, target_ip, port, urls):
+        # 호스트 이름은 여기서 한 번만 IP로 변환한다. sendto에 호스트 이름을 넘기면 프레임마다 주소를 다시 찾는다.
+        # DNS 응답이 느리면 화면이 멈추므로 별도 스레드에서 찾고, 끝났는지는 after()로 확인한다.
+        result = {}
+
+        def resolve():
+            try:
+                result["ip"] = socket.gethostbyname(target_ip)
+            except (OSError, UnicodeError):
+                pass
+
+        thread = threading.Thread(target=resolve, daemon=True, name="resolve-target")
+        thread.start()
+
+        def check_resolved():
+            if thread.is_alive():
+                self._resolve_timer = self.root.after(50, check_resolved)
+                return
+            self._resolve_timer = None
+            if "ip" not in result:
+                self.stop_btn.config(state="disabled")
+                self._refresh_readiness()
+                self._show_error(
+                    "대상 주소를 확인하세요",
+                    "UDP 대상 주소를 찾을 수 없습니다.\nIP 주소(예: 127.0.0.1)나 연결 가능한 호스트 이름을 입력하세요.",
+                )
+                return
+            self._begin_session(target_ip, result["ip"], port, urls)
+
+        self.start_btn.config(state="disabled")
+        # DNS 응답이 오래 걸리면 ‘정지’로 취소할 수 있어야 한다.
+        self.stop_btn.config(state="normal")
+        self.main_status_var.set("대상 주소를 확인하는 중입니다.")
+        self._resolve_timer = self.root.after(0, check_resolved)
+
+    def _begin_session(self, target_ip, resolved_ip, port, urls):
         self.health.reset()
         self._session_start = time.monotonic()
         self._log_time = self._session_start
         diagnostic(
-            "SESSION_START", target_ip=target_ip, port=port, sync_enabled=self.sync_var.get()
+            "SESSION_START",
+            target_ip=target_ip,
+            resolved_ip=resolved_ip,
+            port=port,
+            sync_enabled=self.sync_var.get(),
         )
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.stop_event = threading.Event()
         self._last_ui_error = ""
-        target = (target_ip, port)
+        target = (resolved_ip, port)
         self._reset_stats()
         self.prev_time = time.monotonic()
         self.synchronizer = EyeSynchronizer(
@@ -2329,6 +2471,10 @@ class BridgeApp:
         self.stop()
 
     def stop(self):
+        if self._resolve_timer is not None:
+            # 대상 주소를 찾는 중에 정지하면 찾은 결과를 버린다.
+            self.root.after_cancel(self._resolve_timer)
+            self._resolve_timer = None
         # 확인 타이머가 두 개 돌면, 남은 타이머가 재연결로 새로 시작한 세션을 멈출 수 있다.
         if self._stop_timer is not None:
             self.root.after_cancel(self._stop_timer)
@@ -2410,8 +2556,9 @@ class BridgeApp:
             alive = any(w.channel == ch and w.is_alive() for w in self.workers)
             return "● 재연결 중" if alive else "● 연결 실패"
         if s.error:
-            # 연결된 채널에 남는 오류는 패킷 코드 오류뿐이다. 전체 오류 문구는 하단 상태 줄에 보인다.
-            return "● 패킷 코드 오류"
+            # 연결된 채널에 오류가 남아 있다면 전송 단계(패킷 코드, 카메라 회전·반전, UDP 전송)에서 실패한 것이다.
+            # 어느 단계에서 실패했는지는 하단 상태 줄 문구로 알 수 있다.
+            return "● 전송 오류"
         age = now - s.last_frame_time if s.last_frame_time else 999
         return "● 전송 중" if age < 2 else "응답 대기 중"
 
@@ -2430,15 +2577,21 @@ class BridgeApp:
             self.ready_indicator.configure(fg=ERROR_RED if self._readiness_error() else READY_GREEN)
         stopping = self.stop_event is not None and self.stop_event.is_set()
         if self.synchronizer and not stopping:
+            if not any(s.connected for s in snapshot.values()):
+                self.main_status_var.set("연결 중 · 카메라 응답을 기다리는 중입니다.")
+                return
             sync = self.synchronizer
-            if not sync.enabled:
+            with sync.cv:
+                enabled, confidence = sync.enabled, sync.confidence
+                offset, dropped = sync.offset, sync.dropped
+            if not enabled:
                 eye = "눈 동기화 꺼짐"
             elif not PIL_AVAILABLE:
                 eye = "눈 동기화 Pillow 설치 필요"
             else:
-                state = "보정 완료" if sync.confidence else "분석 중"
-                eye = f"눈 동기화 보정값 {sync.offset * 1000:+.0f} ms({state})"
-            self.main_status_var.set(f"전송 중 · {eye} · 드롭 {sync.dropped}개")
+                state = "보정 완료" if confidence else "분석 중"
+                eye = f"눈 동기화 보정값 {offset * 1000:+.0f} ms({state})"
+            self.main_status_var.set(f"전송 중 · {eye} · 드롭 {dropped}개")
 
     def _log_health(self, snapshot, now):
         elapsed = now - self._log_time
