@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import logging
+import math
 import os
 import queue
 import socket
@@ -1127,6 +1128,7 @@ class BridgeApp:
             else []
         )
         self.editor_window = None
+        self._editor_widget = None
         self._close_editor = None
         self._sync_panel_timer = None
         self._startup_error = None
@@ -1346,10 +1348,17 @@ class BridgeApp:
             if self._hero_original is not None:
                 image = self._hero_original
                 scale = max(width / image.width, height / image.height)
-                resized = image.resize((width, int(image.height * scale)), Image.Resampling.LANCZOS)
-                # 캔버스 비율은 5:1이다. 높이가 남으면 위에서 22% 되는 지점부터 잘라서 보여 준다.
+                resized = image.resize(
+                    (math.ceil(image.width * scale), math.ceil(image.height * scale)),
+                    Image.Resampling.LANCZOS,
+                )
+                # 캔버스 비율은 5:1이다. 높이가 남으면 위에서 22% 되는 지점부터, 너비가 남으면 가운데를
+                # 잘라서 보여 준다.
+                left = (resized.width - width) // 2
                 top = max(0, int((resized.height - height) * 0.22))
-                self._hero_photo = ImageTk.PhotoImage(resized.crop((0, top, width, top + height)))
+                self._hero_photo = ImageTk.PhotoImage(
+                    resized.crop((left, top, left + width, top + height))
+                )
                 hero.create_image(0, 0, image=self._hero_photo, anchor="nw")
             elif hasattr(self, "_hero_photo"):
                 hero.create_image(width, height // 2, image=self._hero_photo, anchor="e")
@@ -2151,8 +2160,18 @@ class BridgeApp:
                 editor.insert("1.0", new_code)
             else:
                 # 메인 창에서 불러온 JSON은 다음에 실행할 때도 사용하도록 기본 파일로 저장한다.
+                previous_code = self.adapter_code
                 self.save_adapter_json(new_code)
                 self.adapter_status_var.set("JSON 불러오기 완료 · 기본 파일에 저장됨")
+                if (
+                    self._editor_widget is not None
+                    and self._editor_widget.get("1.0", "end-1c") == previous_code
+                ):
+                    # 열려 있는 패킷 에디터가 저장된 코드를 그대로 보여 주고 있었다면 새 코드로 갱신한다.
+                    # 편집 중이던 내용은 덮어쓰지 않는다. 이때는 패킷 에디터를 닫을 때 저장 여부를 묻는다.
+                    self._editor_widget.delete("1.0", "end")
+                    self._editor_widget.insert("1.0", new_code)
+                    self._editor_widget.edit_modified(False)
                 if self.workers:
                     self._show_info(
                         "불러오기 완료",
@@ -2213,6 +2232,7 @@ class BridgeApp:
         code.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
         code.insert("1.0", self.adapter_code)
         code.edit_modified(False)
+        self._editor_widget = code
 
         def code_changed(event=None):
             if code.edit_modified():
@@ -2233,6 +2253,7 @@ class BridgeApp:
                 if choice is None or (choice == "save" and not save_code()):
                     return False
             win.destroy()
+            self._editor_widget = None
             self._editor_draft = None
             self._refresh_readiness()
             return True
