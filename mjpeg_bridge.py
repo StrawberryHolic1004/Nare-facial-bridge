@@ -1,5 +1,6 @@
 import ast
 import atexit
+import http.client
 import io
 import json
 import logging
@@ -715,10 +716,24 @@ class MJPEGWorker(threading.Thread):
                             # Receive counters are updated independently from matched/sent counters.
                             self.set_stats(connected=True, error="")
                         else:
-                            count = self.adapter.send(
-                                self.udp_socket, self.target, self.channel, self.frame_id, jpeg
-                            )
-                            self.frame_id = (self.frame_id + 1) & 0xFFFF
+                            frame_id = self.frame_id
+                            self.frame_id = (frame_id + 1) & 0xFFFF
+                            # 패킷 코드나 UDP 전송에서 오류가 나도, 문제없는 카메라 연결까지 끊지는 않는다.
+                            try:
+                                count = self.adapter.send(
+                                    self.udp_socket, self.target, self.channel, frame_id, jpeg
+                                )
+                            except Exception as exc:
+                                diagnostic(
+                                    "SEND_ERROR",
+                                    logging.ERROR,
+                                    channel=self.channel,
+                                    frame_id=frame_id,
+                                    jpeg_bytes=len(jpeg),
+                                    error=repr(exc),
+                                )
+                                self.set_stats(error=f"패킷 코드 오류: {exc}")
+                                continue
                             with self.lock:
                                 st = self.stats[self.channel]
                                 st.frames += 1
@@ -736,6 +751,8 @@ class MJPEGWorker(threading.Thread):
             except Exception as exc:
                 if self.stop_event.is_set():
                     break
+                # IncompleteRead, BadStatusLine 같은 http.client 오류는 OSError가 아니어서 따로 지정한다.
+                retry = isinstance(exc, (OSError, http.client.HTTPException))
                 failure_time = time.monotonic()
                 with self.lock:
                     state = dict(vars(self.stats[self.channel]))
@@ -755,13 +772,13 @@ class MJPEGWorker(threading.Thread):
                     read_ms=round((failure_time - read_started) * 1000, 1),
                     buffered_bytes=len(buffer),
                     stats=state,
-                    retry=isinstance(exc, OSError),
+                    retry=retry,
                     retry_delay_s=retry_delay,
                 )
                 self.set_stats(connected=False, error=f"{type(exc).__name__}: {exc}")
                 if self.synchronizer and self.channel in (CHANNEL_LEFT, CHANNEL_RIGHT):
                     self.synchronizer.reset_channel(self.channel)
-                if not isinstance(exc, OSError):
+                if not retry:
                     break
                 # Close before waiting and reopening only this failed channel.
                 if response is not None:
@@ -802,6 +819,12 @@ class BridgeApp:
 
     def __init__(self, root):
         self.root = root
+        # 사용자가 배너 이미지 등을 바꿔서 사용할 수 있도록, assets는 실행 파일 옆 폴더에서 불러온다.
+        self.app_directory = (
+            Path(sys.executable).resolve().parent
+            if getattr(sys, "frozen", False)
+            else Path(__file__).resolve().parent
+        )
         self._apply_window_icon(root)
         self.root.title(f"나래 - 외부 Facial 브릿지 v{APP_VERSION} by 백설기@")
         self.root.geometry("1280x900")
@@ -810,6 +833,7 @@ class BridgeApp:
         self.sock = None
         self.stop_event = None
         self._reconnect_pending = False
+        self._stop_timer = None
         self.workers = []
         self.synchronizer = None
         self.adapter = None
@@ -818,16 +842,12 @@ class BridgeApp:
         self._auto_start_timer = None
         self._auto_start_suspended = False
         self._editor_draft = None
-        self.app_directory = (
-            Path(sys.executable).resolve().parent
-            if getattr(sys, "frozen", False)
-            else Path(__file__).resolve().parent
-        )
         self.adapter_path = self.app_directory / "packet_adapter.json"
         self.settings_path = self.app_directory / "settings.json"
         self._settings_data = {}
         self._saved_port = None
         self._port_save_timer = None
+        self._url_save_timer = None
         try:
             if self.settings_path.exists():
                 data = json.loads(self.settings_path.read_text(encoding="utf-8-sig"))
@@ -847,6 +867,7 @@ class BridgeApp:
             else []
         )
         self.editor_window = None
+        self._close_editor = None
         self._settings_timer = None
         self._startup_error = None
         if self.adapter_path.exists():
@@ -879,7 +900,7 @@ class BridgeApp:
             variable.trace_add("write", self._connection_settings_changed)
         self.target_port_var.trace_add("write", self._schedule_port_save)
         for variable in self.url_vars.values():
-            variable.trace_add("write", self._save_stream_urls)
+            variable.trace_add("write", self._schedule_url_save)
         if self._startup_error:
             self.root.after(
                 0,
@@ -1339,7 +1360,7 @@ class BridgeApp:
 
     def _apply_window_icon(self, window):
         window.after_idle(lambda: self._theme_title_bar(window))
-        assets = Path(__file__).resolve().parent / "assets"
+        assets = self.app_directory / "assets"
         try:
             if not hasattr(self, "_app_icon") and (assets / "app_icon.png").exists():
                 self._app_icon = tk.PhotoImage(master=self.root, file=str(assets / "app_icon.png"))
@@ -1401,7 +1422,13 @@ class BridgeApp:
         )
         diagnostic("CAMERA_TRANSFORM", channel=channel, rotation=rotation, mirror=flipped)
 
-    def _save_stream_urls(self, *args):
+    def _schedule_url_save(self, *args):
+        if self._url_save_timer is not None:
+            self.root.after_cancel(self._url_save_timer)
+        self._url_save_timer = self.root.after(500, self._save_stream_urls)
+
+    def _save_stream_urls(self):
+        self._url_save_timer = None
         urls = {str(ch): variable.get() for ch, variable in self.url_vars.items()}
         if self._settings_data.get("stream_urls") != urls:
             self._write_settings(dict(self._settings_data, stream_urls=urls))
@@ -1675,8 +1702,9 @@ class BridgeApp:
     def _show_info(self, title, message, parent=None):
         return self._show_dialog(title, message, parent, error=False)
 
-    def _show_dialog(self, title, message, parent=None, error=True):
+    def _show_dialog(self, title, message, parent=None, error=True, buttons=(("확인", True),)):
         parent = parent or self.root
+        result = None
         win = tk.Toplevel(parent)
         self._apply_window_icon(win)
         win.withdraw()
@@ -1710,9 +1738,23 @@ class BridgeApp:
             wraplength=420,
             justify="left",
         ).pack(anchor="w", pady=(10, 22))
-        button = ttk.Button(content, text="확인", style="Accent.TButton", command=win.destroy)
-        button.pack(anchor="e", ipadx=12)
-        win.bind("<Return>", lambda event: win.destroy())
+
+        def choose(value):
+            nonlocal result
+            result = value
+            win.destroy()
+
+        row = tk.Frame(content, bg="#0c1119")
+        row.pack(anchor="e")
+        for index, (text, value) in enumerate(buttons):
+            ttk.Button(
+                row,
+                text=text,
+                style="Accent.TButton" if index == 0 else "TButton",
+                command=lambda value=value: choose(value),
+            ).pack(side="left", ipadx=12, padx=(8 if index else 0, 0))
+        button = row.winfo_children()[0]
+        win.bind("<Return>", lambda event: choose(buttons[0][1]))
         win.bind("<Escape>", lambda event: win.destroy())
         win.update_idletasks()
         width = max(470, win.winfo_reqwidth())
@@ -1727,6 +1769,7 @@ class BridgeApp:
         parent.wait_window(win)
         if previous is not None and previous.winfo_exists():
             previous.grab_set()
+        return result
 
     def _center_main_window(self):
         self._fit_main_window()
@@ -1988,10 +2031,22 @@ class BridgeApp:
         code.bind("<<Modified>>", code_changed)
 
         def close_editor():
+            if code.get("1.0", "end-1c") != self.adapter_code:
+                choice = self._show_dialog(
+                    "저장하지 않은 변경 사항",
+                    "편집한 패킷 코드가 아직 저장되지 않았습니다.\n저장하지 않고 닫으면 변경 내용이 사라집니다.",
+                    parent=win,
+                    error=False,
+                    buttons=(("저장", "save"), ("저장 안 함", "discard"), ("취소", None)),
+                )
+                if choice is None or (choice == "save" and not save_code()):
+                    return False
             win.destroy()
             self._editor_draft = None
             self._refresh_adapter_readiness()
+            return True
 
+        self._close_editor = close_editor
         win.protocol("WM_DELETE_WINDOW", close_editor)
         guide = tk.Text(
             guide_tab,
@@ -2023,8 +2078,10 @@ class BridgeApp:
                     )
                 )
                 code.edit_modified(False)
+                return True
             except Exception as exc:
                 self._show_error("저장 실패", self._error_message(exc), parent=win)
+                return False
 
         def copy_guide():
             self.root.clipboard_clear()
@@ -2186,20 +2243,21 @@ class BridgeApp:
         self.start()
 
     def stop(self):
+        # 확인 타이머가 두 개 돌면, 남은 타이머가 재연결로 새로 시작한 세션을 멈출 수 있다.
+        if self._stop_timer is not None:
+            self.root.after_cancel(self._stop_timer)
+            self._stop_timer = None
         if self.workers and self.stop_event is not None and not self.stop_event.is_set():
             diagnostic("SESSION_STOP", uptime_s=round(time.monotonic() - self._session_start, 1))
         self._cancel_auto_start()
         self._auto_start_suspended = True
         if self.stop_event is not None:
             self.stop_event.set()
-        for worker in self.workers:
-            worker.join(timeout=3.5)
+        # 여기서 join으로 기다리면 안 된다. 워커가 urlopen·read에서 최대 READ_TIMEOUT 동안
+        # 머물 수 있어 그동안 화면이 멈춘다. 대신 after()로 스레드가 모두 끝났는지 주기적으로 확인한다.
         if self.synchronizer is not None:
             with self.synchronizer.cv:
                 self.synchronizer.cv.notify_all()
-            self.synchronizer.thread.join(timeout=1.0)
-            self.synchronizer.calibration_thread.join(timeout=1.0)
-            self.synchronizer.analysis_thread.join(timeout=1.0)
         alive = [worker for worker in self.workers if worker.is_alive()]
         if alive or (
             self.synchronizer is not None
@@ -2210,7 +2268,7 @@ class BridgeApp:
             )
         ):
             self.main_status_var.set("정지 중 · 카메라 연결이 종료되기를 기다립니다.")
-            self.root.after(300, self.stop)
+            self._stop_timer = self.root.after(300, self.stop)
             return
         self.workers = []
         self.synchronizer = None
@@ -2282,7 +2340,8 @@ class BridgeApp:
             )
         elif self.workers:
             self.ready_indicator.configure(fg="#ff4f5e" if self._readiness_error() else "#74e3c2")
-        if self.synchronizer and not errors and not self._last_ui_error:
+        stopping = self.stop_event is not None and self.stop_event.is_set()
+        if self.synchronizer and not stopping and not errors and not self._last_ui_error:
             sync = self.synchronizer
             self.main_status_var.set(
                 f"자동 재연결 | Eye delay: {sync.sent_frames} frames, "
@@ -2371,10 +2430,19 @@ class BridgeApp:
         self.root.after(500, self._update_ui)
 
     def _on_close(self):
+        if (
+            self.editor_window is not None
+            and self.editor_window.winfo_exists()
+            and not self._close_editor()
+        ):
+            return
         if self._port_save_timer is not None:
             self.root.after_cancel(self._port_save_timer)
             self._port_save_timer = None
         self._save_port()
+        if self._url_save_timer is not None:
+            self.root.after_cancel(self._url_save_timer)
+        self._save_stream_urls()
         self._cancel_auto_start()
         self._close_settings()
         self.stop()
