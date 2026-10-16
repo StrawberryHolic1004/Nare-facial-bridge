@@ -1281,7 +1281,7 @@ class BridgeApp:
         label(ph, "{ / }", 18, accent, True).pack(side="left")
         label(ph, "PACKET WORKSPACE", 9, muted).pack(side="right")
         label(packet, "사용자 지정 패킷", 17, bold=True).pack(anchor="w", pady=(8, 5))
-        label(packet, "Python 코드 편집부터 JSON 저장 가능", 10, muted).pack(anchor="w")
+        label(packet, "Python 코드 편집과 JSON 저장", 10, muted).pack(anchor="w")
         self.packet_btn = ttk.Button(
             packet,
             text="패킷 에디터 열기    ↗",
@@ -1290,7 +1290,7 @@ class BridgeApp:
         )
         self.packet_btn.pack(fill="x", ipady=11, pady=(16, 10))
         ttk.Button(packet, text="↓  JSON 불러오기", command=self.load_adapter_json).pack(fill="x")
-        self.adapter_status_var = tk.StringVar(value="저장하면 다음 실행 시 자동 복원됩니다.")
+        self.adapter_status_var = tk.StringVar(value="저장하면 다음 실행 시 자동으로 불러옵니다.")
         label(
             packet,
             size=9,
@@ -1335,7 +1335,7 @@ class BridgeApp:
         companions = card(right)
         companions.pack(side="bottom", fill="x", pady=(14, 0))
         self.program_count_var = tk.StringVar(
-            value=f"시작시 같이 실행될 프로그램 {len(self.companion_programs)}개"
+            value=f"함께 실행할 프로그램 {len(self.companion_programs)}개"
         )
         label(companions, textvariable=self.program_count_var, size=11).pack(side="left")
         ttk.Button(companions, text="프로그램 관리", command=self.open_program_manager).pack(
@@ -1564,7 +1564,7 @@ class BridgeApp:
             self.program_list = None
 
     def _refresh_program_list(self):
-        self.program_count_var.set(f"등록된 프로그램 {len(self.companion_programs)}개")
+        self.program_count_var.set(f"함께 실행할 프로그램 {len(self.companion_programs)}개")
         if self.program_list is None or not self.program_list.winfo_exists():
             return
         self.program_list.delete(*self.program_list.get_children())
@@ -1644,7 +1644,7 @@ class BridgeApp:
         if not self.target_ip_var.get().strip():
             return "UDP 대상 IP 주소를 입력하세요."
         if any(not var.get().strip() for var in self.url_vars.values()):
-            return "모든 카메라 URL을 입력하세요."
+            return "모든 카메라 주소(URL)를 입력하세요."
         return ""
 
     def _auto_start(self):
@@ -1691,7 +1691,7 @@ class BridgeApp:
         detail = str(exc)
         if any("가" <= char <= "힣" for char in detail):
             return detail
-        return "패킷 코드 처리 중 오류가 발생했습니다.\n오류 상세: " + detail
+        return "처리 중 오류가 발생했습니다.\n오류 상세: " + detail
 
     def _show_error(self, title, message, parent=None):
         self._last_ui_error = title
@@ -1840,7 +1840,7 @@ class BridgeApp:
         self.sync_checkbox = box
         title = tk.Label(
             row,
-            text="눈 좌우 딜레이 Sync (매우권장)",
+            text="눈 좌우 지연 동기화(매우 권장)",
             bg="#141d29",
             fg="#eef4fa",
             font=("맑은 고딕", 12, "bold"),
@@ -1979,7 +1979,7 @@ class BridgeApp:
         win = tk.Toplevel(self.root)
         self._apply_window_icon(win)
         self.editor_window = win
-        win.title("패킷 에디터 · JSON 자동 저장")
+        win.title("패킷 에디터")
         win.geometry("1000x760")
         win.minsize(900, 650)
         win.transient(self.root)
@@ -2107,7 +2107,7 @@ class BridgeApp:
                     self.validate_adapter_code(new_code)
                     code.delete("1.0", "end")
                     code.insert("1.0", new_code)
-                    info.set("Python 코드 불러오기 완료 · JSON 저장을 눌러 적용하세요.")
+                    info.set("Python 코드 불러오기 완료 · 저장을 눌러 적용하세요.")
                 except Exception as exc:
                     self._show_error("불러오기 실패", self._error_message(exc), parent=win)
 
@@ -2148,8 +2148,7 @@ class BridgeApp:
                 raise ValueError
         except ValueError:
             self._show_error(
-                "포트 번호를 확인하세요",
-                "포트 번호는 1부터 65535 사이의 정수로 입력하세요.\n예: 5000",
+                "포트 번호를 확인하세요", "포트 번호는 1~65535 사이의 정수로 입력하세요.\n예: 5000"
             )
             return
         target_ip = self.target_ip_var.get().strip()
@@ -2163,7 +2162,7 @@ class BridgeApp:
         if any(not u for u in urls.values()):
             self._show_error(
                 "카메라 주소를 확인하세요",
-                "비어 있는 카메라 주소가 있습니다.\n얼굴, 왼쪽 눈, 오른쪽 눈의 MJPEG URL을 모두 입력하세요.",
+                "비어 있는 카메라 주소가 있습니다.\n얼굴, 왼쪽 눈, 오른쪽 눈의 MJPEG 주소(URL)를 모두 입력하세요.",
             )
             return
         try:
@@ -2172,7 +2171,7 @@ class BridgeApp:
             if not isinstance(test, (list, tuple)) or not all(
                 isinstance(p, bytes) and 0 < len(p) <= 65507 for p in test
             ):
-                raise ValueError("encode_frame은 UDP 패킷(bytes)의 목록을 반환해야 합니다.")
+                raise ValueError("encode_frame은 bytes 패킷의 목록을 반환해야 합니다.")
         except Exception as exc:
             self._show_error("패킷 코드를 확인하세요", self._error_message(exc))
             return
@@ -2223,9 +2222,7 @@ class BridgeApp:
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.reconnect_btn.config(state="normal")
-        self.main_status_var.set(
-            f"Running -> {target_ip}:{port} | custom adapter | manual reconnect"
-        )
+        self.main_status_var.set(f"연결 시작 · {target_ip}:{port}")
 
     def reconnect(self):
         """Destroy old MJPEG HTTP sessions, sync state and UDP socket, then start fresh."""
@@ -2279,10 +2276,9 @@ class BridgeApp:
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
         self.reconnect_btn.config(state="disabled")
-        self.main_status_var.set("Stopped")
         self._refresh_adapter_readiness()
         for _, ch, _ in self.STREAMS:
-            self.status_vars[ch].set("Stopped")
+            self.status_vars[ch].set("대기")
             self.fps_vars[ch].set("0.0")
         if self._reconnect_pending:
             self._reconnect_pending = False
@@ -2302,17 +2298,20 @@ class BridgeApp:
             self.prev_received[ch] = s.received
             self.frame_vars[ch].set(str(s.frames))
             self.size_vars[ch].set(
-                f"{s.last_frame_size / 1024:.1f} KiB" if s.last_frame_size else "-"
+                f"{s.last_frame_size / 1024:.1f} KiB" if s.last_frame_size else "—"
             )
             if not self.workers:
                 status = "대기"
-            elif s.error:
-                status = "● 오류: " + s.error[:20]
             elif not s.connected:
-                status = "오류: " + s.error[:20] if s.error else "연결 중..."
+                # 재시도하지 않는 오류가 난 워커는 이미 종료되어서 다시 연결되지 않는다.
+                alive = any(w.channel == ch and w.is_alive() for w in self.workers)
+                status = ("● 재연결 중" if alive else "● 연결 실패") if s.error else "연결 중..."
+            elif s.error:
+                # 연결된 채널에 남는 오류는 패킷 코드 오류뿐이다. 전체 오류 문구는 하단 상태 줄에 보인다.
+                status = "● 패킷 코드 오류"
             else:
                 age = now - s.last_frame_time if s.last_frame_time else 999
-                status = "● 전송 중" if age < 2 else "응답 대기 · 재연결"
+                status = "● 전송 중" if age < 2 else "응답 대기 중"
             self.status_vars[ch].set(status)
             self.status_labels[ch].configure(
                 fg="#ff8587"
@@ -2343,12 +2342,14 @@ class BridgeApp:
         stopping = self.stop_event is not None and self.stop_event.is_set()
         if self.synchronizer and not stopping and not errors and not self._last_ui_error:
             sync = self.synchronizer
-            self.main_status_var.set(
-                f"자동 재연결 | Eye delay: {sync.sent_frames} frames, "
-                f"delta_t (R-L) {sync.offset * 1000:+.0f} ms "
-                f"({'motion-calibrated' if sync.confidence else 'arrival-based'}), "
-                f"dropped {sync.skipped} | Pillow {'ON' if PIL_AVAILABLE else 'not installed'}"
-            )
+            if not sync.enabled:
+                eye = "눈 동기화 꺼짐"
+            elif not PIL_AVAILABLE:
+                eye = "눈 동기화 Pillow 설치 필요"
+            else:
+                state = "보정 완료" if sync.confidence else "분석 중"
+                eye = f"눈 동기화 보정값 {sync.offset * 1000:+.0f} ms({state})"
+            self.main_status_var.set(f"전송 중 · {eye} · 드롭 {sync.skipped}개")
         if self.workers and now - self._log_time >= 5.0:
             elapsed = now - self._log_time
             self._log_time = now
