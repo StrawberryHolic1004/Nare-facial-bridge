@@ -40,12 +40,21 @@ MAX_BUFFER_BYTES = 16 * 1024 * 1024
 MOTION_HISTORY_SECONDS = 4.0
 LOGGER = logging.getLogger("narebridge")
 # 설정, 로그, 패킷 JSON은 실행 파일 옆에 저장한다. 스크립트로 실행하면 스크립트 옆에 저장한다.
-# 사용자가 배너 이미지 등을 바꿔서 사용할 수 있도록 assets도 같은 폴더에서 불러온다.
 APP_DIRECTORY = (
     Path(sys.executable).resolve().parent
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parent
 )
+
+
+def asset_path(name):
+    # 사용자가 배너 이미지 등을 바꿔서 사용할 수 있도록 실행 파일 옆 assets 폴더의 파일을 먼저 찾는다.
+    # 없으면 PyInstaller가 exe 안에 넣어 둔 기본 파일을 사용한다.
+    for base in (APP_DIRECTORY, Path(getattr(sys, "_MEIPASS", APP_DIRECTORY))):
+        path = base / "assets" / name
+        if path.exists():
+            return path
+    return None
 
 
 class DiagnosticQueueHandler(QueueHandler):
@@ -298,17 +307,31 @@ def record_sent_frame(stats, stats_lock, channel, packets, jpeg_size, sent_time=
         st.error = ""
 
 
+# 채널별로 [마지막으로 남긴 오류, 남긴 시각, 그 뒤 건너뛴 횟수]를 저장한다.
+_SEND_ERROR_LOG = {}
+
+
 def record_send_error(stats, stats_lock, channel, frame_id, jpeg, exc):
+    error, now = repr(exc), time.monotonic()
+    with stats_lock:
+        stats[channel].error = f"패킷 코드 오류: {exc}"
+        # 패킷 코드가 고장 나면 프레임마다 같은 오류가 난다.
+        # 새 오류는 바로 남기고, 같은 오류는 1초에 한 번만 남긴다.
+        last = _SEND_ERROR_LOG.get(channel)
+        if last is not None and last[0] == error and now - last[1] < 1.0:
+            last[2] += 1
+            return
+        suppressed = last[2] if last is not None else 0
+        _SEND_ERROR_LOG[channel] = [error, now, 0]
     diagnostic(
         "SEND_ERROR",
         logging.ERROR,
         channel=channel,
         frame_id=frame_id,
         jpeg_bytes=len(jpeg),
-        error=repr(exc),
+        error=error,
+        suppressed=suppressed,
     )
-    with stats_lock:
-        stats[channel].error = f"패킷 코드 오류: {exc}"
 
 
 class EyeSynchronizer:
@@ -351,11 +374,11 @@ class EyeSynchronizer:
         self.send_thread.start()
         self.calibration_thread.start()
 
+    def threads(self):
+        return (self.send_thread, self.calibration_thread, self.analysis_thread)
+
     def is_alive(self):
-        return any(
-            thread.is_alive()
-            for thread in (self.send_thread, self.calibration_thread, self.analysis_thread)
-        )
+        return any(thread.is_alive() for thread in self.threads())
 
     def _calibrate(self):
         while not self.stop_event.is_set():
@@ -763,8 +786,8 @@ class MJPEGWorker(threading.Thread):
                         if uses_sync:
                             self.synchronizer.add(self.channel, jpeg, arrived)
                             # 동기화 과정에서 프레임이 버려질 수 있으므로, 눈 채널의 상태는 전송 시각이 아닌
-                            # 도착 시각으로 판단한다.
-                            self.set_stats(connected=True, error="", last_frame_time=arrived)
+                            # 도착 시각으로 판단한다. 오류 표시는 전송 쪽에서 관리하고, 다시 연결되면 그때 지운다.
+                            self.set_stats(connected=True, last_frame_time=arrived)
                         else:
                             frame_id = self.frame_id
                             self.frame_id = (frame_id + 1) & 0xFFFF
@@ -788,7 +811,10 @@ class MJPEGWorker(threading.Thread):
                 if self.stop_event.is_set():
                     break
                 # IncompleteRead, BadStatusLine 같은 http.client 오류는 OSError가 아니어서 따로 지정한다.
-                retry = isinstance(exc, (OSError, http.client.HTTPException))
+                # InvalidURL도 여기에 속하지만, 주소 형식이 틀린 경우라 다시 시도해도 소용없다.
+                retry = isinstance(exc, (OSError, http.client.HTTPException)) and not isinstance(
+                    exc, http.client.InvalidURL
+                )
                 failure_time = time.monotonic()
                 with self.stats_lock:
                     state = dict(vars(self.stats[self.channel]))
@@ -1133,8 +1159,8 @@ class BridgeApp:
         )
         hero.pack(fill="x", pady=(0, 16))
         self._hero_original = None
-        asset = APP_DIRECTORY / "assets" / "img.png"
-        if asset.exists():
+        asset = asset_path("img.png")
+        if asset is not None:
             try:
                 if PIL_AVAILABLE:
                     with Image.open(asset) as banner:
@@ -1341,7 +1367,9 @@ class BridgeApp:
             actions, text="▶  연결 시작", style="Accent.TButton", command=self.start
         )
         self.start_btn.pack(side="left", fill="x", expand=True, padx=(0, 7))
-        self.stop_btn = ttk.Button(actions, text="정지", command=self.stop, state="disabled")
+        self.stop_btn = ttk.Button(
+            actions, text="정지", command=self._stop_clicked, state="disabled"
+        )
         self.stop_btn.pack(side="left", padx=(0, 7))
         self.reconnect_btn = ttk.Button(
             actions, text="재연결", command=self.reconnect, state="disabled"
@@ -1376,14 +1404,14 @@ class BridgeApp:
 
     def _apply_window_icon(self, window):
         window.after_idle(lambda: self._theme_title_bar(window))
-        assets = APP_DIRECTORY / "assets"
+        png, ico = asset_path("app_icon.png"), asset_path("app_icon.ico")
         try:
-            if not hasattr(self, "_app_icon") and (assets / "app_icon.png").exists():
-                self._app_icon = tk.PhotoImage(master=self.root, file=str(assets / "app_icon.png"))
+            if not hasattr(self, "_app_icon") and png is not None:
+                self._app_icon = tk.PhotoImage(master=self.root, file=str(png))
             if hasattr(self, "_app_icon"):
                 window.iconphoto(True, self._app_icon)
-            if os.name == "nt" and (assets / "app_icon.ico").exists():
-                window.iconbitmap(str(assets / "app_icon.ico"))
+            if os.name == "nt" and ico is not None:
+                window.iconbitmap(str(ico))
         except tk.TclError:
             pass
 
@@ -2243,6 +2271,10 @@ class BridgeApp:
             return
         self.start()
 
+    def _stop_clicked(self):
+        self._reconnect_pending = False
+        self.stop()
+
     def stop(self):
         # 확인 타이머가 두 개 돌면, 남은 타이머가 재연결로 새로 시작한 세션을 멈출 수 있다.
         if self._stop_timer is not None:
@@ -2320,7 +2352,7 @@ class BridgeApp:
             self.prev_sent[ch] = s.frames
         self.prev_time = now
         errors = [
-            (stream.name, snapshot[stream.channel].error)
+            (stream.label, snapshot[stream.channel].error)
             for stream in self.STREAMS
             if self.workers and snapshot[stream.channel].error
         ]
@@ -2437,6 +2469,14 @@ class BridgeApp:
         self._flush_pending_saves()
         self._cancel_auto_start()
         self._stop_sync_panel_polling()
+        self._stop_clicked()
+        threads = list(self.workers)
+        if self.synchronizer is not None:
+            threads.extend(self.synchronizer.threads())
+        deadline = time.monotonic() + 1.0
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        # 스레드가 모두 끝났다면 UDP 소켓을 닫는 것까지 정리를 마친다.
         self.stop()
         self.root.destroy()
 
